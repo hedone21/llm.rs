@@ -1,3 +1,4 @@
+mod backend;
 mod core;
 
 use anyhow::Result;
@@ -29,7 +30,7 @@ struct Args {
     #[arg(short, long, default_value = "Hello world")]
     prompt: String,
 
-    #[arg(short = 'n', long, default_value_t = 20)]
+    #[arg(short = 'n', long, default_value_t = 99)]
     steps: usize,
 }
 
@@ -79,10 +80,6 @@ fn main() -> Result<()> {
 
     // 6. Encode Prompt
     info!("Encoding Prompt: \"{}\"", args.prompt);
-    let formatted_prompt = format!(
-        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
-        args.prompt
-    );
     let encoding = tokenizer
         .encode(args.prompt.clone(), true)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -100,7 +97,7 @@ fn main() -> Result<()> {
 
     // Llama 3의 종료 토큰 ID (보통 128001: <|end_of_text|> 혹은 128009: <|eot_id|>)
     // Tokenizer json을 봐야 정확하지만, Llama 3 기준 128001이나 128009입니다.
-    let eos_token_ids = vec![128001, 128009];
+    let eos_token_ids = [128001u32, 128009u32];
 
     let mut cur_pos = 0;
 

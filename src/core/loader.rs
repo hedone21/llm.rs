@@ -50,7 +50,7 @@ impl Loader {
         let (data, shape) = self.read_tensor(tensors, name)?;
         debug!("Loading tensor: {} with shape {:?}", name, shape);
         let mut tensor = Tensor::new(data, shape);
-        tensor.set_name(name.to_string());
+        tensor.set_name(name);
         Ok(tensor)
     }
 

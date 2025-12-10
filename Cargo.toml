@@ -13,7 +13,8 @@ memmap2 = "0.9"
 half = "2.7.1"       # bf16 -> f32 변환용
 
 # 토크나이저
-tokenizers = "0.22"
+# tokenizers = "0.22"
+tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
 
 # 유틸리티
 anyhow = "1.0"

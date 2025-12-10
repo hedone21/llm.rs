@@ -1,310 +1,246 @@
 use super::shape::Shape;
-use rayon::prelude::*;
+use std::sync::Arc;
+// backend 모듈과 backend_impl 모듈이 core에 있다고 가정합니다.
+use crate::backend::cpu::CpuBackend;
+use crate::backend::{Backend, Device};
+
+#[derive(Debug)]
+pub enum Storage {
+    // 1. 일반 CPU 메모리 (Vec<f32>)
+    Cpu(Vec<f32>),
+
+    // 2. 안드로이드 공유 메모리 (Zero-Copy)
+    // CPU는 ptr로 접근, GPU/NPU는 handle(fd)로 접근
+    Shared {
+        ptr: *mut u8,
+        handle: usize, // file descriptor or AHardwareBuffer pointer
+        size: usize,
+    },
+
+    // 3. 디바이스 전용 메모리 (접근 불가, 포인터만 유지)
+    OpenClBuffer(usize),
+    QnnTensor(usize),
+}
+
+// 포인터를 포함하므로 Thread Safety를 위해 마킹 (실제 구현 시 주의 필요)
+unsafe impl Send for Storage {}
+unsafe impl Sync for Storage {}
 
 #[derive(Debug, Clone)]
 pub struct Tensor {
     name: Option<String>,
-    pub data: Vec<f32>,
     shape: Shape,
+    device: Device,
+    // 데이터 소유권을 공유하기 위해 Arc 사용
+    pub storage: Arc<Storage>,
 }
 
 impl Tensor {
+    // [생성자] 일반 CPU 텐서
     pub fn new(data: Vec<f32>, shape: Shape) -> Self {
         if data.len() != shape.num_elements() {
             panic!("Data size mismatch");
         }
         Self {
             name: None,
-            data,
             shape,
+            device: Device::Cpu,
+            storage: Arc::new(Storage::Cpu(data)),
         }
     }
 
-    pub fn set_name(&mut self, name: String) {
-        self.name = Some(name);
+    // [생성자] 공유 메모리 텐서 (안드로이드 최적화)
+    // 실제로는 AHardwareBuffer_allocate 등을 호출해야 함
+    pub fn new_shared(shape: Shape) -> Self {
+        let size_bytes = shape.num_elements() * 4;
+
+        // Mockup: 실제로는 mmap된 포인터를 사용해야 함
+        // 여기서는 벡터를 만들고 포인터만 취한 뒤 잊어버리는(forget) 흉내만 냅니다.
+        let mut vec = vec![0u8; size_bytes];
+        let ptr = vec.as_mut_ptr();
+        std::mem::forget(vec); // 메모리 해제 방지 (실제 구현에선 소멸자 처리 필요)
+
+        Self {
+            name: None,
+            shape,
+            device: Device::Cpu, // 기본적으로 CPU에서 접근 가능
+            storage: Arc::new(Storage::Shared {
+                ptr,
+                handle: 0, // Mock FD
+                size: size_bytes,
+            }),
+        }
     }
-    pub fn data(&self) -> &[f32] {
-        &self.data
+
+    // [Helper] 0으로 초기화된 텐서
+    pub fn zeros(shape: Shape) -> Self {
+        let count = shape.num_elements();
+        Self::new(vec![0.0; count], shape)
     }
-    pub fn data_mut(&mut self) -> &mut [f32] {
-        &mut self.data
+
+    pub fn set_name(&mut self, name: &str) {
+        self.name = Some(name.to_string());
     }
+
+    // [속성] Shape 반환
     pub fn shape(&self) -> &Shape {
         &self.shape
     }
 
-    pub fn zeros(shape: Shape) -> Self {
-        let count = shape.num_elements();
-        Self {
-            name: None,
-            data: vec![0.0; count],
-            shape,
+    // [데이터 접근] 읽기 전용 슬라이스
+    // 주의: CPU 접근 가능한 스토리지일 때만 동작
+    pub fn data(&self) -> &[f32] {
+        match &*self.storage {
+            Storage::Cpu(vec) => vec,
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
+            _ => panic!("Tensor data is not accessible on CPU directly"),
         }
     }
 
+    // [데이터 접근] 쓰기 전용 슬라이스
+    // 주의: Reference Count가 1일 때만 수정 가능 (CoW는 여기선 생략)
+    pub fn data_mut(&mut self) -> &mut [f32] {
+        // Arc의 유일한 소유자인지 확인하고, 아니면 복사(Clone)해야 하지만
+        // 성능을 위해 여기서는 Unsafe하게 포인터를 따거나,
+        // Storage가 Cpu일 때 get_mut을 시도합니다.
+
+        // Shared Memory의 경우 항상 접근 허용
+        if let Storage::Shared { ptr, size, .. } = *self.storage {
+            return unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, size / 4) };
+        }
+
+        // CPU Memory의 경우
+        match Arc::get_mut(&mut self.storage) {
+            Some(Storage::Cpu(vec)) => vec,
+            _ => panic!("Cannot mutate shared or non-cpu storage"),
+        }
+    }
+
+    // [Offloading] 디바이스 이동
+    pub fn to_device(&self, target: Device) -> Self {
+        if self.device == target {
+            return self.clone();
+        }
+
+        match (&*self.storage, target) {
+            // Shared Memory는 장치만 바꾸면 됨 (Zero-Copy)
+            (Storage::Shared { .. }, _) => {
+                let mut new_tensor = self.clone();
+                new_tensor.device = target;
+                new_tensor
+            }
+            // CPU -> GPU/NPU (복사 필요)
+            (Storage::Cpu(_), _) => {
+                // TODO: 실제 백엔드 버퍼 할당 및 업로드 로직
+                // 현재는 Mockup으로 CPU 유지
+                let mut new_t = self.clone();
+                new_t.device = target;
+                new_t
+            }
+            _ => unimplemented!("Transfer not implemented"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Backend Dispatcher & Operations
+    // -------------------------------------------------------------------------
+
+    fn backend(&self) -> Box<dyn Backend> {
+        match self.device {
+            Device::Cpu => Box::new(CpuBackend),
+            _ => unimplemented!("Backend for device not implemented"),
+        }
+    }
+
+    // A @ B
+    pub fn matmul(&self, other: &Tensor) -> Tensor {
+        let backend = self.backend();
+        if self.device != other.device {
+            let other_dev = other.to_device(self.device);
+            return backend.matmul(self, &other_dev);
+        }
+        backend.matmul(self, other)
+    }
+
+    // A @ B^T
+    pub fn matmul_transposed(&self, other: &Tensor) -> Tensor {
+        let backend = self.backend();
+        if self.device != other.device {
+            let other_dev = other.to_device(self.device);
+            return backend.matmul_transposed(self, &other_dev);
+        }
+        backend.matmul_transposed(self, other)
+    }
+
+    // A @ Slice^T (Zero-Copy)
+    pub fn matmul_slice(&self, other_data: &[f32], rows: usize, cols: usize) -> Tensor {
+        // Slice는 현재 CPU 메모리에 있다고 가정하므로,
+        // Device가 GPU라면 임시 버퍼 업로드가 필요할 수 있음.
+        // 현재는 CPU Backend에 최적화됨.
+        self.backend().matmul_slice(self, other_data, rows, cols)
+    }
+
+    // In-Place Add
     pub fn add_assign(&mut self, other: &Tensor) {
-        if self.shape != other.shape {
-            panic!("Shape mismatch in add_assign");
-        }
-        self.data
-            .par_iter_mut()
-            .zip(other.data.par_iter())
-            .for_each(|(a, b)| *a += *b);
+        // 백엔드에서 In-Place 수정
+        self.backend().add_assign(self, other);
     }
 
+    // Helper for non-assign version
     pub fn add(&self, other: &Tensor) -> Tensor {
         let mut res = self.clone();
         res.add_assign(other);
         res
     }
 
+    // Fused SiLU + Mul
     pub fn silu_mul_inplace(&mut self, other: &Tensor) {
-        if self.shape != other.shape {
-            panic!("Shape mismatch in silu_mul_inplace");
-        }
-        self.data
-            .par_iter_mut()
-            .zip(other.data.par_iter())
-            .for_each(|(x, y)| {
-                let val = *x;
-                let silu = val / (1.0 + (-val).exp());
-                *x = silu * *y;
-            });
+        self.backend().silu_mul(self, other);
     }
 
-    // [수정] 표준 행렬 곱 (A @ B) - 올바른 로직으로 복구
-    pub fn matmul(&self, other: &Tensor) -> Tensor {
-        let dims_a = self.shape.dims();
-        let dims_b = other.shape.dims();
-
-        if dims_a.len() != 2 || dims_b.len() != 2 {
-            panic!("MatMul only supports 2D tensors");
-        }
-        let (m, k) = (dims_a[0], dims_a[1]);
-        let (k2, n) = (dims_b[0], dims_b[1]);
-
-        if k != k2 {
-            panic!(
-                "MatMul Dimension mismatch: ({}, {}) @ ({}, {})",
-                m, k, k2, n
-            );
-        }
-
-        let mut result_data = vec![0.0; m * n];
-        let a_data = &self.data;
-        let b_data = &other.data;
-
-        // 병렬 처리 (B가 연속적이지 않으므로 cache 효율은 낮지만 로직은 정확함)
-        result_data
-            .par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(i, res_row)| {
-                for j in 0..n {
-                    let mut sum = 0.0;
-                    for p in 0..k {
-                        unsafe {
-                            sum +=
-                                *a_data.get_unchecked(i * k + p) * *b_data.get_unchecked(p * n + j);
-                        }
-                    }
-                    res_row[j] = sum;
-                }
-            });
-
-        Tensor::new(result_data, Shape::new(vec![m, n]))
+    // RMS Norm
+    pub fn rms_norm(&self, weight: &Tensor, eps: f32) -> Tensor {
+        self.backend().rms_norm(self, weight, eps)
     }
 
-    // [최적화] A @ B^T (B가 이미 Transposed된 상태일 때 사용)
-    pub fn matmul_transposed(&self, other_t: &Tensor) -> Tensor {
-        let dims_a = self.shape.dims();
-        let dims_b_t = other_t.shape.dims();
-        let (m, k) = (dims_a[0], dims_a[1]);
-        let (n, k2) = (dims_b_t[0], dims_b_t[1]);
-
-        if k != k2 {
-            panic!(
-                "Dimension mismatch for matmul_transposed: A[{},{}] vs B_t[{},{}]",
-                m, k, n, k2
-            );
-        }
-
-        let mut result_data = vec![0.0; m * n];
-        let a_data = &self.data;
-        let b_data = &other_t.data;
-
-        result_data
-            .par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(i, res_row)| {
-                let a_row_start = i * k;
-                let a_slice = &a_data[a_row_start..a_row_start + k];
-                for j in 0..n {
-                    let b_row_start = j * k;
-                    let b_slice = &b_data[b_row_start..b_row_start + k];
-                    let sum: f32 = a_slice.iter().zip(b_slice.iter()).map(|(x, y)| x * y).sum();
-                    res_row[j] = sum;
-                }
-            });
-        Tensor::new(result_data, Shape::new(vec![m, n]))
+    // Softmax
+    pub fn softmax(&self) -> Tensor {
+        self.backend().softmax(self)
     }
 
+    // Scaling
+    pub fn scale(&self, value: f32) -> Tensor {
+        self.backend().scale(self, value)
+    }
+
+    // RoPE In-Place
+    pub fn apply_rope_inplace(&mut self, start_pos: usize) {
+        self.backend().rope_inplace(self, start_pos);
+    }
+
+    // Transpose
+    // (Loader 최적화로 인해 사용 빈도는 줄었으나, fallback용으로 유지)
     pub fn transpose(&self) -> Tensor {
+        // Transpose는 구조적 변경이므로 보통 Copy가 일어남
+        // CPU 백엔드 구현을 사용하거나 각 백엔드별 구현 호출
+        // 여기서는 CpuBackend의 구현이 있다고 가정하고 호출하거나 직접 구현
+        // 편의상 CpuBackend 로직을 복사해 둠 (Backend trait에 transpose가 없다면)
+        // 하지만 Backend trait에 copy_from 등이 있으므로,
+        // 여기서는 간단히 CPU 로직으로 처리 (대부분 로딩 타임에만 쓰임)
+
         let dims = self.shape.dims();
         let (m, n) = (dims[0], dims[1]);
-        let mut new_data = vec![0.0; self.data.len()];
+        let mut new_data = vec![0.0; m * n];
+        let data = self.data(); // CPU access needed
+
+        // Naive transpose (loading time only)
         for i in 0..m {
             for j in 0..n {
-                new_data[j * m + i] = self.data[i * n + j];
+                new_data[j * m + i] = data[i * n + j];
             }
         }
         Tensor::new(new_data, Shape::new(vec![n, m]))
-    }
-
-    pub fn rms_norm(&self, weight: &Tensor, eps: f32) -> Tensor {
-        let dims = self.shape.dims();
-        let last_dim = *dims.last().unwrap();
-        let mut output_data = vec![0.0; self.data.len()];
-        let w_data = weight.data();
-
-        output_data
-            .par_chunks_mut(last_dim)
-            .zip(self.data.par_chunks(last_dim))
-            .for_each(|(out_row, in_row)| {
-                let ss: f32 = in_row.iter().map(|v| v * v).sum();
-                let rms = (ss / last_dim as f32 + eps).sqrt();
-                let scale = 1.0 / rms;
-                for j in 0..last_dim {
-                    out_row[j] = in_row[j] * scale * w_data[j];
-                }
-            });
-        Tensor::new(output_data, self.shape.clone())
-    }
-
-    pub fn softmax(&self) -> Tensor {
-        let dims = self.shape.dims();
-        let last_dim = *dims.last().unwrap();
-        let mut output_data = vec![0.0; self.data.len()];
-
-        output_data
-            .par_chunks_mut(last_dim)
-            .zip(self.data.par_chunks(last_dim))
-            .for_each(|(out_row, in_row)| {
-                let max_val = in_row.iter().fold(f32::MIN, |a, &b| a.max(b));
-                let mut sum_exp = 0.0;
-                for j in 0..last_dim {
-                    let e = (in_row[j] - max_val).exp();
-                    out_row[j] = e;
-                    sum_exp += e;
-                }
-                let inv_sum = 1.0 / sum_exp;
-                for j in 0..last_dim {
-                    out_row[j] *= inv_sum;
-                }
-            });
-        Tensor::new(output_data, self.shape.clone())
-    }
-
-    pub fn scale(&self, value: f32) -> Tensor {
-        let new_data: Vec<f32> = self.data.par_iter().map(|&x| x * value).collect();
-        Tensor::new(new_data, self.shape.clone())
-    }
-
-    pub fn apply_rope_inplace(&mut self, start_pos: usize) {
-        let dims = self.shape.dims();
-        let head_dim = *dims.last().unwrap();
-        let mid = head_dim / 2;
-        let theta_base = 500_000.0f32;
-
-        self.data
-            .par_chunks_mut(head_dim)
-            .enumerate()
-            .for_each(|(i, chunk)| {
-                let pos = start_pos + i;
-                for j in 0..mid {
-                    let freq_idx = (j as f32 * 2.0) / (head_dim as f32);
-                    let theta = 1.0 / theta_base.powf(freq_idx);
-                    let m_theta = (pos as f32) * theta;
-                    let (sin, cos) = m_theta.sin_cos();
-
-                    let x = chunk[j];
-                    let y = chunk[j + mid];
-
-                    chunk[j] = x * cos - y * sin;
-                    chunk[j + mid] = x * sin + y * cos;
-                }
-            });
-    }
-
-    pub fn apply_rope(&self, pos: usize) -> Tensor {
-        let mut res = self.clone();
-        res.apply_rope_inplace(pos);
-        res
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // 1. MatMul 테스트: (1x2) @ (2x2) 행렬 곱 확인
-    #[test]
-    fn test_matmul_simple() {
-        let a = Tensor::new(vec![1.0, 2.0], Shape::new(vec![1, 2]));
-        // Identity Matrix
-        let b = Tensor::new(vec![1.0, 0.0, 0.0, 1.0], Shape::new(vec![2, 2]));
-
-        let c = a.matmul(&b);
-        assert_eq!(c.data(), &[1.0, 2.0]);
-    }
-
-    // 2. RoPE 테스트 (핵심!)
-    #[test]
-    fn test_rope_correctness() {
-        // HeadDim = 2 (짝수여야 함)
-        let input = Tensor::new(vec![1.0, 0.0], Shape::new(vec![1, 2]));
-
-        // Case A: Position 0
-        // cos(0)=1, sin(0)=0 이므로 값의 변화가 없어야 함
-        let out_0 = input.apply_rope(0);
-        assert_eq!(out_0.data(), &[1.0, 0.0], "RoPE at pos 0 must be Identity");
-
-        // Case B: Position > 0
-        // 값이 변해야 함 (회전 발생)
-        let out_1 = input.apply_rope(1);
-        assert_ne!(out_1.data(), &[1.0, 0.0], "RoPE at pos 1 must rotate");
-
-        // 수동 검증: Theta Base = 500,000
-        // i=0 (첫번째 쌍), freq_idx = 0/2 = 0 -> theta = 1.0
-        // pos=1 -> m_theta = 1.0
-        // x=1, y=0
-        // out[0] = 1*cos(1) - 0*sin(1) = cos(1) ≈ 0.5403
-        // out[1] = 1*sin(1) + 0*cos(1) = sin(1) ≈ 0.8414
-        let d = out_1.data();
-        assert!((d[0] - 0.5403).abs() < 0.01);
-        assert!((d[1] - 0.8414).abs() < 0.01);
-    }
-
-    // 3. RMS Norm 테스트
-    #[test]
-    fn test_rms_norm() {
-        // [3.0, 4.0] -> 제곱합 25 -> 평균 12.5 -> sqrt(12.5) ≈ 3.5355
-        // Norm -> [3/3.53, 4/3.53] ≈ [0.848, 1.131]
-        let input = Tensor::new(vec![3.0, 4.0], Shape::new(vec![1, 2]));
-        let weight = Tensor::new(vec![1.0, 1.0], Shape::new(vec![2])); // 가중치 1
-
-        let out = input.rms_norm(&weight, 1e-5);
-        let d = out.data();
-
-        assert!((d[0] - 0.8485).abs() < 0.001);
-        assert!((d[1] - 1.1313).abs() < 0.001);
-    }
-
-    // 4. Softmax 테스트 (확률의 합은 1.0)
-    #[test]
-    fn test_softmax_sum_to_one() {
-        let input = Tensor::new(vec![1.0, 2.0, 3.0], Shape::new(vec![1, 3]));
-        let out = input.softmax();
-        let sum: f32 = out.data().iter().sum();
-        assert!((sum - 1.0).abs() < 0.0001);
     }
 }
