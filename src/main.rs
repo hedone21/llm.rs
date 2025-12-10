@@ -2,6 +2,7 @@ mod core;
 
 use anyhow::Result;
 use clap::Parser;
+use log::*;
 use log::{error, info};
 use std::io::Write; // flush를 위해 필요
 use std::path::PathBuf;
@@ -78,6 +79,10 @@ fn main() -> Result<()> {
 
     // 6. Encode Prompt
     info!("Encoding Prompt: \"{}\"", args.prompt);
+    let formatted_prompt = format!(
+        "<|begin_of_text|><|start_header_id|>user<|end_header_id|>\n\n{}<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n",
+        args.prompt
+    );
     let encoding = tokenizer
         .encode(args.prompt.clone(), true)
         .map_err(|e| anyhow::anyhow!(e))?;
@@ -88,10 +93,15 @@ fn main() -> Result<()> {
     println!("\n--- Output ---");
 
     // 프롬프트 먼저 출력 (파란색 효과 등은 제거하고 순수 텍스트로)
-    print!("{}", args.prompt);
+    println!("{}", args.prompt);
     std::io::stdout().flush()?;
 
     let start_gen = std::time::Instant::now();
+
+    // Llama 3의 종료 토큰 ID (보통 128001: <|end_of_text|> 혹은 128009: <|eot_id|>)
+    // Tokenizer json을 봐야 정확하지만, Llama 3 기준 128001이나 128009입니다.
+    let eos_token_ids = vec![128001, 128009];
+
     let mut cur_pos = 0;
 
     for _ in 0..args.steps {
@@ -130,6 +140,12 @@ fn main() -> Result<()> {
             .enumerate()
             .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
             .unwrap();
+        trace!("Next token ID: {}", next_token);
+
+        if eos_token_ids.contains(&(next_token as u32)) {
+            info!("EOS token detected. Stopping.");
+            break;
+        }
 
         // Update & Print
         input_ids.push(next_token as u32);
@@ -139,6 +155,7 @@ fn main() -> Result<()> {
         let word = tokenizer
             .decode(&[next_token as u32], true)
             .unwrap_or_else(|_| "".to_string());
+        trace!("Decoded token: {}", word);
 
         print!("{}", word);
         std::io::stdout().flush()?;

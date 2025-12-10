@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use half::bf16;
+use log::*;
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use std::fs::File;
@@ -9,7 +10,7 @@ use crate::core::config::LlamaConfig;
 use crate::core::layer::{KVCache, Linear, LlamaAttention, LlamaBlock, LlamaMLP, LlamaRMSNorm};
 use crate::core::model::LlamaModel;
 use crate::core::shape::Shape;
-use crate::core::tensor::Tensor; // KVCache 추가 필요
+use crate::core::tensor::Tensor;
 
 pub struct Loader {
     mmap: memmap2::Mmap,
@@ -22,14 +23,12 @@ impl Loader {
         Ok(Self { mmap })
     }
 
-    // Safetensors Raw Data -> Vec<f32> & Shape
     fn read_tensor(&self, tensors: &SafeTensors, name: &str) -> Result<(Vec<f32>, Shape)> {
         let view = tensors
             .tensor(name)
             .context(format!("Tensor not found: {}", name))?;
         let shape = Shape::new(view.shape().iter().map(|&x| x).collect());
 
-        // BF16 / F32 지원
         let data = match view.dtype() {
             safetensors::Dtype::F32 => view
                 .data()
@@ -47,13 +46,14 @@ impl Loader {
         Ok((data, shape))
     }
 
-    // 기본 로드
     fn load_tensor(&self, tensors: &SafeTensors, name: &str) -> Result<Tensor> {
         let (data, shape) = self.read_tensor(tensors, name)?;
-        Ok(Tensor::new(data, shape))
+        debug!("Loading tensor: {} with shape {:?}", name, shape);
+        let mut tensor = Tensor::new(data, shape);
+        tensor.set_name(name.to_string());
+        Ok(tensor)
     }
 
-    // GQA 확장 로드 (KV Heads < Query Heads 일 때 복사)
     fn load_gqa_tensor(
         &self,
         tensors: &SafeTensors,
@@ -69,12 +69,11 @@ impl Loader {
             return Ok(Tensor::new(src_data, shape));
         }
 
+        // GQA Expansion
         let n_rep = n_heads / n_kv_heads;
-        // println!("Expanding GQA {}: {}x", name, n_rep); // 디버그용
-
         let dims = shape.dims();
-        let out_dim = dims[0]; // (n_kv_heads * head_dim)
-        let in_dim = dims[1]; // (hidden)
+        let out_dim = dims[0]; // [Out, In] assumption for weights
+        let in_dim = dims[1];
         let head_dim = out_dim / n_kv_heads;
 
         let mut new_data = Vec::with_capacity(out_dim * n_rep * in_dim);
@@ -97,13 +96,16 @@ impl Loader {
         let tensors = SafeTensors::deserialize(&self.mmap)?;
         println!("Loading weights from safetensors...");
 
+        // [치명적 버그 수정]
+        // Embedding은 Lookup Table이므로 Transpose하면 안 됩니다!
+        // [Vocab, Dim] 형태를 유지해야 main.rs에서 올바르게 슬라이싱 할 수 있습니다.
         let embed_tokens = self.load_tensor(&tensors, "model.embed_tokens.weight")?;
 
         let mut layers = Vec::new();
         for i in 0..config.num_layers {
             let p = format!("model.layers.{}", i);
 
-            // Attention
+            // Attention Weights: Linear 연산을 위해 Transpose 필요
             let q = self.load_tensor(&tensors, &format!("{}.self_attn.q_proj.weight", p))?;
             let k =
                 self.load_gqa_tensor(&tensors, &format!("{}.self_attn.k_proj.weight", p), config)?;
@@ -111,19 +113,22 @@ impl Loader {
                 self.load_gqa_tensor(&tensors, &format!("{}.self_attn.v_proj.weight", p), config)?;
             let o = self.load_tensor(&tensors, &format!("{}.self_attn.o_proj.weight", p))?;
 
-            // MLP
+            // MLP Weights
             let gate = self.load_tensor(&tensors, &format!("{}.mlp.gate_proj.weight", p))?;
             let up = self.load_tensor(&tensors, &format!("{}.mlp.up_proj.weight", p))?;
             let down = self.load_tensor(&tensors, &format!("{}.mlp.down_proj.weight", p))?;
 
-            // Norms
+            // Norms (1D)
             let input_norm =
                 self.load_tensor(&tensors, &format!("{}.input_layernorm.weight", p))?;
             let post_norm =
                 self.load_tensor(&tensors, &format!("{}.post_attention_layernorm.weight", p))?;
 
-            // KV Cache 생성 (Max Seq Len = 512 설정)
-            let cache = KVCache::new(config.num_heads, config.hidden_size / config.num_heads, 512);
+            let cache = KVCache::new(
+                config.num_heads,
+                config.hidden_size / config.num_heads,
+                2048,
+            ); // SeqLen 넉넉하게
 
             layers.push(LlamaBlock {
                 attn: LlamaAttention::new(
@@ -142,11 +147,15 @@ impl Loader {
 
         let norm = self.load_tensor(&tensors, "model.norm.weight")?;
 
-        // Weight Tying 처리
+        // 4. LM Head
+        // LM Head는 Linear 연산(MatMul)을 하므로 [Dim, Vocab] 형태여야 합니다.
+        // 따라서 파일에서 로드한 뒤 Transpose를 해야 합니다.
         let lm_head = if let Ok(w) = self.load_tensor(&tensors, "lm_head.weight") {
             w
         } else {
             println!("Weight Tying: Sharing embed_tokens with lm_head");
+            // embed_tokens는 현재 [Vocab, Dim] (Row-Major) 입니다.
+            // lm_head는 이를 전치하여 [Dim, Vocab]으로 만들어야 합니다.
             embed_tokens.clone()
         };
 

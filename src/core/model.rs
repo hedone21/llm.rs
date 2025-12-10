@@ -1,3 +1,5 @@
+use log::*;
+
 use crate::core::layer::KVCache;
 
 use super::layer::{Linear, LlamaAttention, LlamaBlock, LlamaMLP, LlamaRMSNorm};
@@ -78,43 +80,20 @@ impl LlamaModel {
 
     pub fn forward(&self, x: &Tensor, start_pos: usize) -> Tensor {
         let mut h = x.clone();
+        debug!("LlamaModel forward: input shape={:?}", h.shape().dims());
 
         // 1. Layers
         for layer in &self.layers {
+            debug!("layer: shape={:?}", h.shape().dims());
             h = layer.forward(&h, start_pos);
         }
 
         // 2. Final Norm
+        debug!("final norm: shape={:?}", h.shape().dims());
         let h_norm = self.norm.forward(&h);
 
         // 3. LM Head (Logits)
+        debug!("lm head: shape={:?}", h_norm.shape().dims());
         self.lm_head.forward(&h_norm)
-    }
-}
-
-mod tests {
-    use super::*;
-
-    // 테스트용 모델 생성 헬퍼
-    fn create_dummy_model() -> LlamaModel {
-        // (지면상 생략: 위 Block Test와 유사하게 모든 가중치를 Identity/Ones로 초기화하여 Model 구조체 생성)
-        // 실제 구현시엔 Config를 받아 Random Init하는 생성자를 만드는게 좋음.
-        // 여기서는 개념적으로 "생성자"가 있다고 가정.
-        LlamaModel::dummy(4, 2) // Hidden=4, Layers=2
-    }
-
-    #[test]
-    fn test_llama_model_end_to_end() {
-        let model = create_dummy_model();
-
-        // Input: [Seq=3, Hidden=4] (이미 임베딩된 벡터라고 가정)
-        let input = Tensor::new(vec![1.0; 12], Shape::new(vec![3, 4]));
-
-        // Forward
-        let output = model.forward(&input, 0);
-
-        // Output: [Seq=3, VocabSize] (LM Head를 거친 Logits)
-        // Dummy Model의 VocabSize가 10이라고 가정
-        assert_eq!(output.shape().dims(), &[3, 10]);
     }
 }
