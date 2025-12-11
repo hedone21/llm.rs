@@ -29,3 +29,13 @@ rayon = "1.11"
 # log
 log = "0.4"
 env_logger = "0.10"
+
+[features]
+default = [] 
+profile = []
+
+[profile.release]
+opt-level = 3       # 최고 수준 최적화
+lto = "fat"         # 모든 크레이트를 통합해서 최적화 (시간 오래 걸리지만 가장 빠름)
+codegen-units = 1   # 병렬 코드 생성 끄기 (하나의 단위로 분석하여 최적화 효율 증대)
+panic = "abort"     # 패닉 발생 시 스택 풀기 생략 (코드 크기 감소 및 속도 향상)

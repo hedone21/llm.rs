@@ -1,20 +1,23 @@
 mod backend;
 mod core;
+mod profile;
 
 use anyhow::Result;
 use clap::Parser;
 use log::*;
 use log::{error, info};
+use rand::Rng;
+use std::collections::HashSet;
 use std::io::Write; // flush를 위해 필요
 use std::path::PathBuf;
-use tokenizers::Tokenizer; // [New] log 매크로 사용
+use tokenizers::Tokenizer; // [New] 랜덤 샘플링을 위해 필요
 
 use crate::core::config::LlamaConfig;
 use crate::core::loader::Loader;
 use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
+use crate::profile::Profiler;
 
-/// Simple Llama 3.2 Inference Engine in Rust
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -30,141 +33,233 @@ struct Args {
     #[arg(short, long, default_value = "Hello world")]
     prompt: String,
 
-    #[arg(short = 'n', long, default_value_t = 99)]
+    #[arg(short = 'n', long, default_value_t = 200)]
     steps: usize,
+
+    // [옵션] 반복 페널티 (기본 1.1 -> 1.2로 상향 추천)
+    #[arg(short = 'r', long, default_value_t = 1.2)]
+    repeat_penalty: f32,
+
+    #[arg(short = 'w', long, default_value_t = 64)]
+    penalty_window: usize,
+
+    // [New] Temperature (창의성 조절: 높을수록 다양함, 낮을수록 보수적)
+    #[arg(long, default_value_t = 0.8)]
+    temperature: f32,
+
+    // [New] Top-P (Nucleus Sampling: 상위 P% 확률 내에서만 뽑기)
+    #[arg(long, default_value_t = 0.9)]
+    top_p: f32,
 }
 
 fn main() -> Result<()> {
-    // 1. 로거 초기화 (Custom Format)
-    // 환경변수 RUST_LOG가 없으면 "info" 레벨로 설정
     if std::env::var("RUST_LOG").is_err() {
         unsafe { std::env::set_var("RUST_LOG", "info") };
     }
-
-    // 로그 포맷을 깔끔하게 커스텀 (시간, 레벨 색상 등)
     env_logger::Builder::from_default_env()
         .format(|buf, record| {
             use std::io::Write;
-            let ts = buf.timestamp_seconds();
-            let level_style = buf.default_level_style(record.level());
-            writeln!(
-                buf,
-                "[{} {}] {}",
-                ts,
-                level_style.value(record.level()),
-                record.args()
-            )
+            writeln!(buf, "[{}] {}", record.level(), record.args())
         })
         .init();
 
-    // 2. 인자 파싱
     let args = Args::parse();
-    info!("Starting Rust LLM...");
-    info!("Args: {:?}", args);
+    // ... (로딩 로그 생략) ...
 
-    // 3. Config 로드
-    info!("Loading Config from {:?}...", args.config);
-    let config_file = std::fs::File::open(&args.config)
-        .map_err(|_| anyhow::anyhow!("Config file not found: {:?}", args.config))?;
+    let config_file = std::fs::File::open(&args.config)?;
     let config: LlamaConfig = serde_json::from_reader(std::io::BufReader::new(config_file))?;
-
-    // 4. Model 로드
-    info!("Loading Model from {:?}...", args.model);
     let loader = Loader::new(&args.model)?;
     let model = loader.load_model(&config)?;
-    info!("Model loaded successfully.");
-
-    // 5. Tokenizer 로드
-    info!("Loading Tokenizer from {:?}...", args.tokenizer);
     let tokenizer = Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!(e))?;
+    profile!("0. Model Loading"); // 블록이 끝나면 자동 기록됨
 
-    // 6. Encode Prompt
-    info!("Encoding Prompt: \"{}\"", args.prompt);
     let encoding = tokenizer
         .encode(args.prompt.clone(), true)
         .map_err(|e| anyhow::anyhow!(e))?;
     let mut input_ids: Vec<u32> = encoding.get_ids().to_vec();
 
-    // 7. Generation Loop
-    info!("Generating {} tokens...", args.steps);
     println!("\n--- Output ---");
-
-    // 프롬프트 먼저 출력 (파란색 효과 등은 제거하고 순수 텍스트로)
-    println!("{}", args.prompt);
+    print!("{}", args.prompt);
     std::io::stdout().flush()?;
 
     let start_gen = std::time::Instant::now();
-
-    // Llama 3의 종료 토큰 ID (보통 128001: <|end_of_text|> 혹은 128009: <|eot_id|>)
-    // Tokenizer json을 봐야 정확하지만, Llama 3 기준 128001이나 128009입니다.
-    let eos_token_ids = [128001u32, 128009u32];
-
+    let eos_token_ids = [128001u32, 128009u32]; // Llama 3 EOS
     let mut cur_pos = 0;
+    let mut rng = rand::thread_rng(); // 랜덤 생성기
 
-    for _ in 0..args.steps {
-        let seq_len = input_ids.len();
+    {
+        profile!("1. Total Inference");
 
-        let (input_chunk, chunk_len) = if cur_pos == 0 {
-            (input_ids.clone(), seq_len)
-        } else {
-            (vec![*input_ids.last().unwrap()], 1)
-        };
-
-        // Embedding Lookup
-        let hidden = config.hidden_size;
-        let mut embed_data = Vec::with_capacity(chunk_len * hidden);
-        let all_embeds = model.embed_tokens.data();
-
-        for &id in &input_chunk {
-            let start = (id as usize) * hidden;
-            if start + hidden > all_embeds.len() {
-                anyhow::bail!("Token ID {} out of vocab range", id);
+        for _ in 0..args.steps {
+            let input_chunk: Vec<u32>;
+            let chunk_len: usize;
+            {
+                profile!("2. Step Generation");
+                let seq_len = input_ids.len();
+                (input_chunk, chunk_len) = if cur_pos == 0 {
+                    (input_ids.clone(), seq_len)
+                } else {
+                    (vec![*input_ids.last().unwrap()], 1)
+                };
             }
-            embed_data.extend_from_slice(&all_embeds[start..start + hidden]);
+
+            let input_tensor: Tensor;
+            {
+                profile!("3. Input Preparation");
+                // Embedding
+                let hidden = config.hidden_size;
+                let mut embed_data = Vec::with_capacity(chunk_len * hidden);
+                let all_embeds = model.embed_tokens.data();
+                for &id in &input_chunk {
+                    let start = (id as usize) * hidden;
+                    embed_data.extend_from_slice(&all_embeds[start..start + hidden]);
+                }
+                input_tensor = Tensor::new(embed_data, Shape::new(vec![chunk_len, hidden]));
+            }
+
+            // Forward
+            let logits: Tensor;
+            {
+                profile!("4. Forward Pass");
+                logits = model.forward(&input_tensor, cur_pos);
+            }
+
+            let mut next_token_logits: Vec<f32>;
+            {
+                profile!("5. Logits Extraction");
+                let logits_data = logits.data();
+                let vocab = config.vocab_size;
+
+                // 마지막 토큰의 Logits 추출
+                let start_idx = (chunk_len - 1) * vocab;
+                next_token_logits = logits_data[start_idx..start_idx + vocab].to_vec();
+
+                // 1. Repetition Penalty 적용
+                let penalty = args.repeat_penalty;
+                if penalty > 1.0 {
+                    let window_start =
+                        if args.penalty_window > 0 && input_ids.len() > args.penalty_window {
+                            input_ids.len() - args.penalty_window
+                        } else {
+                            0
+                        };
+                    let tokens_to_penalize: HashSet<_> = input_ids[window_start..].iter().collect();
+
+                    for &id in tokens_to_penalize {
+                        let id = id as usize;
+                        if id < next_token_logits.len() {
+                            let score = next_token_logits[id];
+                            if score < 0.0 {
+                                next_token_logits[id] = score * penalty;
+                            } else {
+                                next_token_logits[id] = score / penalty;
+                            }
+                        }
+                    }
+                }
+
+                // 2. Temperature 적용 (Logits 스케일링)
+                let temp = args.temperature;
+                if (temp - 1.0).abs() > 1e-6 {
+                    for logit in next_token_logits.iter_mut() {
+                        *logit /= temp;
+                    }
+                }
+            }
+
+            // 3. Softmax (확률 변환)
+            {
+                profile!("6. Sampling");
+                let max_logit = next_token_logits.iter().fold(f32::MIN, |a, &b| a.max(b));
+                let mut probs: Vec<f32> = next_token_logits
+                    .iter()
+                    .map(|l| (l - max_logit).exp())
+                    .collect();
+                let sum_probs: f32 = probs.iter().sum();
+                for p in probs.iter_mut() {
+                    *p /= sum_probs;
+                }
+
+                // 4. Top-P Sampling (Nucleus)
+                let next_token = if args.top_p < 1.0 {
+                    // [최적화] 전체 Vocab(128k)을 정렬하면 느림.
+                    // 확률이 너무 낮은(예: 0.0) 토큰은 Top-P에 들어갈 가망이 없으므로 제외.
+                    let threshold = 1e-5; // 0.00001보다 작은 확률은 무시
+
+                    let mut sorted_probs: Vec<(f32, usize)> = probs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, p)| p > &&threshold) // [추가됨] 가지치기
+                        .map(|(i, &p)| (p, i))
+                        .collect();
+
+                    // 확률 높은 순으로 정렬 (이제 개수가 몇 개 안 되어 매우 빠름)
+                    sorted_probs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+
+                    let mut cumulative_prob = 0.0;
+                    let mut cutoff_index = sorted_probs.len() - 1;
+
+                    for (i, (prob, _)) in sorted_probs.iter().enumerate() {
+                        cumulative_prob += prob;
+                        if cumulative_prob > args.top_p {
+                            cutoff_index = i;
+                            break;
+                        }
+                    }
+
+                    // Top-P에 포함된 후보들 중에서 다시 확률 분포에 따라 랜덤 선택
+                    let valid_candidates = &sorted_probs[0..=cutoff_index];
+                    let total_valid_prob: f32 = valid_candidates.iter().map(|(p, _)| p).sum();
+
+                    let mut r = rng.random::<f32>() * total_valid_prob;
+                    let mut selected_token = valid_candidates[0].1;
+
+                    for (prob, idx) in valid_candidates {
+                        r -= prob;
+                        if r <= 0.0 {
+                            selected_token = *idx;
+                            break;
+                        }
+                    }
+                    selected_token
+                } else {
+                    // Top-P 미사용 시 단순 확률 비례 샘플링 (Roulette Wheel)
+                    let mut r = rng.random::<f32>(); // 0.0 ~ 1.0
+                    let mut selected_token = 0;
+                    for (i, p) in probs.iter().enumerate() {
+                        r -= p;
+                        if r <= 0.0 {
+                            selected_token = i;
+                            break;
+                        }
+                    }
+                    selected_token
+                };
+
+                // EOS Check
+                if eos_token_ids.contains(&(next_token as u32)) {
+                    break;
+                }
+
+                input_ids.push(next_token as u32);
+                cur_pos += chunk_len;
+
+                let word = tokenizer
+                    .decode(&[next_token as u32], true)
+                    .unwrap_or_else(|_| "".to_string());
+
+                print!("{}", word);
+                std::io::stdout().flush()?;
+            }
         }
-        let input_tensor = Tensor::new(embed_data, Shape::new(vec![chunk_len, hidden]));
-
-        // Forward
-        let logits = model.forward(&input_tensor, cur_pos);
-
-        // Greedy Sampling
-        let logits_data = logits.data();
-        let vocab = config.vocab_size;
-        let last_logits = &logits_data[(chunk_len - 1) * vocab..];
-
-        let (next_token, _) = last_logits
-            .iter()
-            .enumerate()
-            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap_or(std::cmp::Ordering::Equal))
-            .unwrap();
-        trace!("Next token ID: {}", next_token);
-
-        if eos_token_ids.contains(&(next_token as u32)) {
-            info!("EOS token detected. Stopping.");
-            break;
-        }
-
-        // Update & Print
-        input_ids.push(next_token as u32);
-        cur_pos += chunk_len;
-
-        // 토큰 출력은 로그가 아니라 실제 출력이므로 print! 사용
-        let word = tokenizer
-            .decode(&[next_token as u32], true)
-            .unwrap_or_else(|_| "".to_string());
-        trace!("Decoded token: {}", word);
-
-        print!("{}", word);
-        std::io::stdout().flush()?;
     }
 
-    let elapsed = start_gen.elapsed();
-    println!("\n--------------"); // 줄바꿈
+    Profiler::print_stats();
 
-    // 결과 통계는 다시 로그로
+    let elapsed = start_gen.elapsed();
+    println!("\n--------------");
     info!(
-        "Generation finished in {:.2}s ({:.2} tok/s)",
-        elapsed.as_secs_f64(),
+        "Finished: {:.2} tok/s",
         args.steps as f64 / elapsed.as_secs_f64()
     );
 

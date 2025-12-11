@@ -8,6 +8,10 @@ use crate::backend::{Backend, Device};
 pub enum Storage {
     // 1. 일반 CPU 메모리 (Vec<f32>)
     Cpu(Vec<f32>),
+    CpuQ4 {
+        data: Vec<u8>,
+        scales: Vec<f32>,
+    },
 
     // 2. 안드로이드 공유 메모리 (Zero-Copy)
     // CPU는 ptr로 접근, GPU/NPU는 handle(fd)로 접근
@@ -76,6 +80,52 @@ impl Tensor {
     pub fn zeros(shape: Shape) -> Self {
         let count = shape.num_elements();
         Self::new(vec![0.0; count], shape)
+    }
+
+    pub fn quantize_q4(&self) -> Tensor {
+        let data_f32 = self.data();
+
+        let block_size = 32;
+        let num_blocks = (data_f32.len() + block_size - 1) / block_size;
+
+        // 데이터 크기는 절반으로 줄어듦 (32개 f32 -> 16개 u8)
+        let mut q_data = Vec::with_capacity(data_f32.len() / 2);
+        let mut scales = Vec::with_capacity(num_blocks);
+
+        for chunk in data_f32.chunks(block_size) {
+            let max_abs = chunk.iter().fold(0.0f32, |acc, &x| acc.max(x.abs()));
+            let scale = max_abs / 7.0;
+            scales.push(scale);
+
+            // [수정] 정확한 패킹 개수 계산 (홀수 길이 처리 포함)
+            let num_pairs = (chunk.len() + 1) / 2;
+
+            if scale == 0.0 {
+                // 0x88 (0, 0) 값으로 채움
+                q_data.extend(std::iter::repeat(0x88).take(num_pairs));
+            } else {
+                let inv_scale = 1.0 / scale;
+                for pair in chunk.chunks(2) {
+                    let v0 = pair[0];
+                    let v1 = if pair.len() > 1 { pair[1] } else { 0.0 };
+
+                    let q0 = ((v0 * inv_scale) + 8.5).clamp(0.0, 15.0) as u8;
+                    let q1 = ((v1 * inv_scale) + 8.5).clamp(0.0, 15.0) as u8;
+                    let packed = q0 | (q1 << 4);
+                    q_data.push(packed);
+                }
+            }
+        }
+
+        Tensor {
+            name: self.name.clone(),
+            shape: self.shape.clone(),
+            device: self.device,
+            storage: Arc::new(Storage::CpuQ4 {
+                data: q_data,
+                scales,
+            }),
+        }
     }
 
     pub fn set_name(&mut self, name: &str) {

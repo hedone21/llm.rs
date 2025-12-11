@@ -1,6 +1,7 @@
 use super::tensor::Tensor;
-use crate::core::shape::Shape;
+use crate::{core::shape::Shape, profile};
 use log::*;
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 use std::cell::RefCell;
 
 pub struct Linear {
@@ -81,15 +82,14 @@ impl LlamaAttention {
         }
     }
 
-    fn extract_head(&self, tensor: &Tensor, head_idx: usize) -> Tensor {
+    fn extract_head_impl(tensor: &Tensor, head_idx: usize, n_heads: usize) -> Tensor {
         let dims = tensor.shape().dims();
         let seq_len = dims[0];
         let hidden = dims[1];
-        let head_dim = hidden / self.n_heads;
+        let head_dim = hidden / n_heads;
         let mut new_data = Vec::with_capacity(seq_len * head_dim);
         let src = tensor.data();
 
-        // 이 부분은 어쩔 수 없이 strided copy가 발생하지만, seq_len이 작을 땐 빠릅니다.
         for i in 0..seq_len {
             let start = i * hidden + head_idx * head_dim;
             new_data.extend_from_slice(&src[start..start + head_dim]);
@@ -98,73 +98,90 @@ impl LlamaAttention {
     }
 
     pub fn forward(&self, x: &Tensor, start_pos: usize) -> Tensor {
+        // 1. Q, K, V Projection
         let q_all = self.q_proj.forward(x);
         let k_all = self.k_proj.forward(x);
         let v_all = self.v_proj.forward(x);
 
         let seq_len = x.shape().dims()[0];
         let hidden = x.shape().dims()[1];
-        let head_dim = hidden / self.n_heads;
+        let n_heads = self.n_heads;
+        let head_dim = hidden / n_heads;
         let max_seq = self.cache.max_seq_len;
 
+        // 결과 저장용 버퍼
         let mut context_data = vec![0.0; seq_len * hidden];
 
-        for h in 0..self.n_heads {
-            let mut q_head = self.extract_head(&q_all, h);
-            let mut k_head = self.extract_head(&k_all, h);
-            let v_head = self.extract_head(&v_all, h);
+        // KV Cache의 Raw Pointer 추출 (RefCell 우회)
+        let mut k_cache_guard = self.cache.k.borrow_mut();
+        let mut v_cache_guard = self.cache.v.borrow_mut();
+
+        let k_base_addr = k_cache_guard.data_mut().as_mut_ptr() as usize;
+        let v_base_addr = v_cache_guard.data_mut().as_mut_ptr() as usize;
+        let ctx_base_addr = context_data.as_mut_ptr() as usize;
+
+        // Read-Only 텐서는 참조 공유
+        let q_ref = &q_all;
+        let k_ref = &k_all;
+        let v_ref = &v_all;
+
+        // 2. Parallel Head Processing (Rayon)
+        // [수정] move 키워드 추가: SendPtr를 복사해서 캡처하도록 강제
+        (0..n_heads).into_par_iter().for_each(move |h| {
+            // 포인터 복원
+            let k_base_ptr = k_base_addr as *mut f32;
+            let v_base_ptr = v_base_addr as *mut f32;
+            let ctx_base_ptr = ctx_base_addr as *mut f32;
+
+            // 정적 함수 호출
+            let mut q_head = Self::extract_head_impl(q_ref, h, n_heads);
+            let mut k_head = Self::extract_head_impl(k_ref, h, n_heads);
+            let v_head = Self::extract_head_impl(v_ref, h, n_heads);
 
             q_head.apply_rope_inplace(start_pos);
             k_head.apply_rope_inplace(start_pos);
 
-            // 1. KV Cache Update (Layout Optimized)
-            {
-                let mut c_k = self.cache.k.borrow_mut();
-                let mut c_v = self.cache.v.borrow_mut();
-                let k_ptr = c_k.data_mut();
-                let v_ptr = c_v.data_mut();
-
+            // 1. KV Cache Update (Unsafe Pointer Arithmetic)
+            unsafe {
                 let k_src = k_head.data();
                 let v_src = v_head.data();
 
-                // Head Offset 계산
                 let k_head_offset = h * (max_seq * head_dim);
                 let v_head_offset = h * (head_dim * max_seq);
 
                 for i in 0..seq_len {
                     let pos = start_pos + i;
-
-                    // K Update: [Head, Pos, :] -> 연속 복사 (빠름)
-                    let k_dest_idx = k_head_offset + pos * head_dim;
                     let src_idx = i * head_dim;
-                    k_ptr[k_dest_idx..k_dest_idx + head_dim]
-                        .copy_from_slice(&k_src[src_idx..src_idx + head_dim]);
 
-                    // V Update: [Head, :, Pos] -> 전치 저장 (Transposed Storage)
-                    // 나중에 Probs @ V 할 때 열(Column) 단위 접근을 피하기 위해 미리 돌려놓습니다.
+                    // K Update
+                    let k_dest_idx = k_head_offset + pos * head_dim;
+                    let k_dest_ptr = k_base_ptr.add(k_dest_idx);
+                    std::ptr::copy_nonoverlapping(
+                        k_src.as_ptr().add(src_idx),
+                        k_dest_ptr,
+                        head_dim,
+                    );
+
+                    // V Update (Transposed)
                     for d in 0..head_dim {
                         let v_dest_idx = v_head_offset + d * max_seq + pos;
-                        v_ptr[v_dest_idx] = v_src[src_idx + d];
+                        *v_base_ptr.add(v_dest_idx) = v_src[src_idx + d];
                     }
                 }
             }
 
-            // 2. Attention Score (Zero-Copy)
+            // 2. Attention Score
             let total_len = start_pos + seq_len;
-            let c_k = self.cache.k.borrow();
 
-            // K Slice 추출 (복사 없음!)
-            let k_start = h * (max_seq * head_dim);
-            // 현재까지 유효한 데이터만 슬라이싱
-            let k_slice = &c_k.data()[k_start..k_start + total_len * head_dim];
+            // Cache 읽기 (Unsafe Slice)
+            let k_slice = unsafe {
+                let k_start = h * (max_seq * head_dim);
+                std::slice::from_raw_parts(k_base_ptr.add(k_start), total_len * head_dim)
+            };
 
-            // Q @ K^T
-            // K_slice는 [TotalLen, HeadDim] 형태의 연속 메모리입니다.
             let scores = q_head.matmul_slice(k_slice, total_len, head_dim);
-
             let mut scaled_scores = scores.scale(1.0 / (head_dim as f32).sqrt());
 
-            // Causal Masking
             if seq_len > 1 {
                 let data = scaled_scores.data_mut();
                 for i in 0..seq_len {
@@ -177,59 +194,62 @@ impl LlamaAttention {
             }
             let probs = scaled_scores.softmax();
 
-            // 3. Context Calculation (Zero-Copy & Optimized Decoding)
-            // Context = Probs @ V
-            // V는 [Head, HeadDim, MaxSeq] 형태로 저장되어 있습니다.
-            // 즉, V의 각 행(Row)은 특정 차원(d)의 전체 시계열 데이터입니다.
-
-            let c_v = self.cache.v.borrow();
-            let v_data = c_v.data();
+            // 3. Context Calculation
             let v_head_offset = h * (head_dim * max_seq);
-            let probs_data = probs.data(); // [Seq, TotalLen]
+            let probs_data = probs.data();
 
-            // Decoding 단계 (Seq=1) 최적화
             if seq_len == 1 {
+                // Decoding Optimization
                 let mut ctx_vec = vec![0.0; head_dim];
-                for d in 0..head_dim {
-                    // V의 d번째 행 (길이 MaxSeq) 중 유효한 TotalLen만큼 슬라이싱
-                    let v_row_start = v_head_offset + d * max_seq;
-                    let v_row_slice = &v_data[v_row_start..v_row_start + total_len];
-
-                    // 내적: Probs(1, TL) . V_row_d(TL)
-                    // V가 전치되어 저장된 덕분에 연속 메모리 내적이 가능합니다.
-                    let sum: f32 = probs_data
-                        .iter()
-                        .zip(v_row_slice.iter())
-                        .map(|(a, b)| a * b)
-                        .sum();
-                    ctx_vec[d] = sum;
-                }
-
-                let dest = h * head_dim;
-                context_data[dest..dest + head_dim].copy_from_slice(&ctx_vec);
-            } else {
-                // Prefill 단계 (Seq > 1)
-                // 복잡한 인덱싱 대신 안전하게 Tensor로 재구성하여 연산 (초기 1회만 수행되므로 OK)
-                let mut v_hist = Vec::with_capacity(total_len * head_dim);
-                for i in 0..total_len {
+                unsafe {
                     for d in 0..head_dim {
-                        let idx = v_head_offset + d * max_seq + i;
-                        v_hist.push(v_data[idx]);
+                        let v_row_start = v_head_offset + d * max_seq;
+                        let v_row_slice =
+                            std::slice::from_raw_parts(v_base_ptr.add(v_row_start), total_len);
+
+                        let sum: f32 = probs_data
+                            .iter()
+                            .zip(v_row_slice.iter())
+                            .map(|(a, b)| a * b)
+                            .sum();
+                        ctx_vec[d] = sum;
+                    }
+
+                    let dest = h * head_dim;
+                    std::ptr::copy_nonoverlapping(
+                        ctx_vec.as_ptr(),
+                        ctx_base_ptr.add(dest),
+                        head_dim,
+                    );
+                }
+            } else {
+                // Prefill Optimization
+                let mut v_hist = Vec::with_capacity(total_len * head_dim);
+                unsafe {
+                    for i in 0..total_len {
+                        for d in 0..head_dim {
+                            let idx = v_head_offset + d * max_seq + i;
+                            v_hist.push(*v_base_ptr.add(idx));
+                        }
                     }
                 }
                 let v_view = Tensor::new(v_hist, Shape::new(vec![total_len, head_dim]));
-                // 표준 연산: Probs(Seq, TL) @ V(TL, HD)
                 let context = probs.matmul(&v_view);
+                let ctx_src = context.data();
 
-                let ctx_ptr = context.data();
-                for i in 0..seq_len {
-                    let dest = i * hidden + h * head_dim;
-                    let src = i * head_dim;
-                    context_data[dest..dest + head_dim]
-                        .copy_from_slice(&ctx_ptr[src..src + head_dim]);
+                unsafe {
+                    for i in 0..seq_len {
+                        let dest = i * hidden + h * head_dim;
+                        let src = i * head_dim;
+                        std::ptr::copy_nonoverlapping(
+                            ctx_src.as_ptr().add(src),
+                            ctx_base_ptr.add(dest),
+                            head_dim,
+                        );
+                    }
                 }
             }
-        }
+        });
 
         self.o_proj.forward(&Tensor::new(
             context_data,
@@ -260,14 +280,37 @@ pub struct LlamaBlock {
 
 impl LlamaBlock {
     pub fn forward(&self, x: &Tensor, start_pos: usize) -> Tensor {
-        let h_norm = self.input_norm.forward(x);
-        let mut attn_out = self.attn.forward(&h_norm, start_pos);
-        attn_out.add_assign(x);
+        let h_norm: Tensor;
+        {
+            profile!("4.2.1. LlamaBlock Attention");
+            h_norm = self.input_norm.forward(x);
+        }
+        let mut attn_out: Tensor;
+        {
+            profile!("4.2.2. LlamaBlock Attention");
+            attn_out = self.attn.forward(&h_norm, start_pos);
+        }
+        {
+            profile!("4.2.3. LlamaBlock Attention Residual");
+            attn_out.add_assign(x);
+        }
         let h = attn_out;
 
-        let h_norm2 = self.post_norm.forward(&h);
-        let mut mlp_out = self.mlp.forward(&h_norm2);
-        mlp_out.add_assign(&h);
+        let h_norm2: Tensor;
+        {
+            profile!("4.2.4. LlamaBlock MLP");
+            h_norm2 = self.post_norm.forward(&h);
+        }
+
+        let mut mlp_out: Tensor;
+        {
+            profile!("4.2.5. LlamaBlock MLP");
+            mlp_out = self.mlp.forward(&h_norm2);
+        }
+        {
+            profile!("4.2.6. LlamaBlock MLP Residual");
+            mlp_out.add_assign(&h);
+        }
         mlp_out
     }
 }

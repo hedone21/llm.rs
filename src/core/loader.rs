@@ -46,12 +46,18 @@ impl Loader {
         Ok((data, shape))
     }
 
-    fn load_tensor(&self, tensors: &SafeTensors, name: &str) -> Result<Tensor> {
+    fn load_tensor(&self, tensors: &SafeTensors, name: &str, quantize: bool) -> Result<Tensor> {
         let (data, shape) = self.read_tensor(tensors, name)?;
-        debug!("Loading tensor: {} with shape {:?}", name, shape);
+        // debug!("Loading tensor: {} ...", name); // 로그 줄이기
         let mut tensor = Tensor::new(data, shape);
         tensor.set_name(name);
-        Ok(tensor)
+
+        if quantize {
+            // [최적화] 즉시 Q8 포맷으로 변환하여 메모리 절약 및 가속 준비
+            Ok(tensor.quantize_q4())
+        } else {
+            Ok(tensor)
+        }
     }
 
     fn load_gqa_tensor(
@@ -94,41 +100,50 @@ impl Loader {
 
     pub fn load_model(&self, config: &LlamaConfig) -> Result<LlamaModel> {
         let tensors = SafeTensors::deserialize(&self.mmap)?;
-        println!("Loading weights from safetensors...");
+        println!("Loading weights (with Q8 Quantization)...");
 
-        // [치명적 버그 수정]
-        // Embedding은 Lookup Table이므로 Transpose하면 안 됩니다!
-        // [Vocab, Dim] 형태를 유지해야 main.rs에서 올바르게 슬라이싱 할 수 있습니다.
-        let embed_tokens = self.load_tensor(&tensors, "model.embed_tokens.weight")?;
+        // Embedding은 보통 양자화하지 않음 (Lookup 속도 및 정밀도 유지)
+        let embed_tokens = self.load_tensor(&tensors, "model.embed_tokens.weight", false)?;
 
         let mut layers = Vec::new();
         for i in 0..config.num_layers {
             let p = format!("model.layers.{}", i);
 
-            // Attention Weights: Linear 연산을 위해 Transpose 필요
-            let q = self.load_tensor(&tensors, &format!("{}.self_attn.q_proj.weight", p))?;
-            let k =
-                self.load_gqa_tensor(&tensors, &format!("{}.self_attn.k_proj.weight", p), config)?;
-            let v =
-                self.load_gqa_tensor(&tensors, &format!("{}.self_attn.v_proj.weight", p), config)?;
-            let o = self.load_tensor(&tensors, &format!("{}.self_attn.o_proj.weight", p))?;
+            // [핵심] Attention 및 MLP의 Linear 가중치들을 양자화(True)
+            // Transpose 없이 로드 -> Q8 변환 -> backend에서 Hybrid 연산
+            let q = self.load_tensor(&tensors, &format!("{}.self_attn.q_proj.weight", p), true)?;
 
-            // MLP Weights
-            let gate = self.load_tensor(&tensors, &format!("{}.mlp.gate_proj.weight", p))?;
-            let up = self.load_tensor(&tensors, &format!("{}.mlp.up_proj.weight", p))?;
-            let down = self.load_tensor(&tensors, &format!("{}.mlp.down_proj.weight", p))?;
+            // GQA Tensor (K, V)도 양자화 가능하지만, GQA 로직 복잡성을 피하기 위해 일단 F32 유지
+            // (성능을 더 높이려면 load_gqa_tensor 내부에서도 quantize 수행 필요)
+            let k = self
+                .load_gqa_tensor(&tensors, &format!("{}.self_attn.k_proj.weight", p), config)?
+                .quantize_q4();
+            let v = self
+                .load_gqa_tensor(&tensors, &format!("{}.self_attn.v_proj.weight", p), config)?
+                .quantize_q4();
 
-            // Norms (1D)
+            let o = self.load_tensor(&tensors, &format!("{}.self_attn.o_proj.weight", p), true)?;
+
+            // MLP 가중치 양자화 (가장 파라미터가 많음 -> 효과 큼)
+            let gate = self.load_tensor(&tensors, &format!("{}.mlp.gate_proj.weight", p), true)?;
+            let up = self.load_tensor(&tensors, &format!("{}.mlp.up_proj.weight", p), true)?;
+            let down = self.load_tensor(&tensors, &format!("{}.mlp.down_proj.weight", p), true)?;
+
+            // Norm은 파라미터가 적으므로 F32 유지 (정밀도 중요)
             let input_norm =
-                self.load_tensor(&tensors, &format!("{}.input_layernorm.weight", p))?;
-            let post_norm =
-                self.load_tensor(&tensors, &format!("{}.post_attention_layernorm.weight", p))?;
+                self.load_tensor(&tensors, &format!("{}.input_layernorm.weight", p), false)?;
+            let post_norm = self.load_tensor(
+                &tensors,
+                &format!("{}.post_attention_layernorm.weight", p),
+                false,
+            )?;
 
+            // ... (KVCache 생성 등 기존 코드)
             let cache = KVCache::new(
                 config.num_heads,
                 config.hidden_size / config.num_heads,
                 2048,
-            ); // SeqLen 넉넉하게
+            );
 
             layers.push(LlamaBlock {
                 attn: LlamaAttention::new(
@@ -145,18 +160,13 @@ impl Loader {
             });
         }
 
-        let norm = self.load_tensor(&tensors, "model.norm.weight")?;
+        let norm = self.load_tensor(&tensors, "model.norm.weight", false)?;
 
-        // 4. LM Head
-        // LM Head는 Linear 연산(MatMul)을 하므로 [Dim, Vocab] 형태여야 합니다.
-        // 따라서 파일에서 로드한 뒤 Transpose를 해야 합니다.
-        let lm_head = if let Ok(w) = self.load_tensor(&tensors, "lm_head.weight") {
+        // LM Head도 크기가 크므로 양자화 추천 (단, 정확도 민감하면 false)
+        let lm_head = if let Ok(w) = self.load_tensor(&tensors, "lm_head.weight", true) {
             w
         } else {
-            println!("Weight Tying: Sharing embed_tokens with lm_head");
-            // embed_tokens는 현재 [Vocab, Dim] (Row-Major) 입니다.
-            // lm_head는 이를 전치하여 [Dim, Vocab]으로 만들어야 합니다.
-            embed_tokens.clone()
+            embed_tokens.clone().quantize_q4()
         };
 
         Ok(LlamaModel {
