@@ -1,0 +1,11 @@
+# NDK 경로 설정 (예시)
+export NDK_HOME=/opt/android-ndk
+# 호스트 OS (Linux의 경우 linux-x86_64, Mac의 경우 darwin-x86_64)
+export HOST_TAG=linux-x86_64
+export TOOLCHAIN=$NDK_HOME/toolchains/llvm/prebuilt/$HOST_TAG
+
+# 컴파일러 경로 지정 (API 레벨 24 예시)
+export CC_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang
+export CXX_aarch64_linux_android=$TOOLCHAIN/bin/aarch64-linux-android21-clang++
+export AR_aarch64_linux_android=$TOOLCHAIN/bin/llvm-ar
+export CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$TOOLCHAIN/bin/aarch64-linux-android21-clang

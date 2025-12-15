@@ -1,3 +1,5 @@
+#![cfg_attr(target_arch = "aarch64", feature(stdarch_neon_dotprod))]
+
 mod backend;
 mod core;
 mod profile;
@@ -196,9 +198,15 @@ fn main() -> Result<()> {
                     // 확률 높은 순으로 정렬 (이제 개수가 몇 개 안 되어 매우 빠름)
                     sorted_probs.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
 
-                    let mut cumulative_prob = 0.0;
-                    let mut cutoff_index = sorted_probs.len() - 1;
+                    // 모든 확률이 threshold보다 낮아 후보가 없다면, 전체를 다시 포함시킵니다.
+                    if sorted_probs.is_empty() {
+                        sorted_probs = probs.iter().enumerate().map(|(i, &p)| (p, i)).collect();
+                    }
 
+                    let mut cumulative_prob = 0.0;
+
+                    // sorted_probs가 비어있지 않음을 보장했으므로 안전합니다.
+                    let mut cutoff_index = sorted_probs.len().saturating_sub(1);
                     for (i, (prob, _)) in sorted_probs.iter().enumerate() {
                         cumulative_prob += prob;
                         if cumulative_prob > args.top_p {

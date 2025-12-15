@@ -29,56 +29,6 @@ impl LlamaModel {
         }
     }
 
-    // 테스트용 더미 모델 생성자
-    pub fn dummy(hidden_dim: usize, num_layers: usize) -> Self {
-        let vocab_size = 10;
-        let w_eye = Tensor::new(
-            vec![1.0; hidden_dim * hidden_dim],
-            Shape::new(vec![hidden_dim, hidden_dim]),
-        ); // Shape mismatch fix needed for real identity
-        let w_ones = Tensor::new(vec![1.0; hidden_dim], Shape::new(vec![hidden_dim]));
-
-        // (간소화를 위해 모든 가중치를 1.0으로 채움)
-        let create_linear = || {
-            Linear::new(Tensor::new(
-                vec![0.1; hidden_dim * hidden_dim],
-                Shape::new(vec![hidden_dim, hidden_dim]),
-            ))
-        };
-
-        let mut layers = Vec::new();
-        for _ in 0..num_layers {
-            layers.push(LlamaBlock {
-                attn: LlamaAttention {
-                    q_proj: create_linear(),
-                    k_proj: create_linear(),
-                    v_proj: create_linear(),
-                    o_proj: create_linear(),
-                    n_heads: 2,
-                    cache: KVCache::new(2, hidden_dim / 2, 512),
-                },
-                mlp: LlamaMLP::new(create_linear(), create_linear(), create_linear()),
-                input_norm: LlamaRMSNorm::new(w_ones.clone(), 1e-5),
-                post_norm: LlamaRMSNorm::new(w_ones.clone(), 1e-5),
-            });
-        }
-
-        let head_weight = Tensor::new(
-            vec![0.1; hidden_dim * vocab_size],
-            Shape::new(vec![hidden_dim, vocab_size]),
-        );
-
-        Self {
-            embed_tokens: Tensor::new(
-                vec![0.1; vocab_size * hidden_dim],
-                Shape::new(vec![vocab_size, hidden_dim]),
-            ),
-            layers,
-            norm: LlamaRMSNorm::new(w_ones, 1e-5),
-            lm_head: Linear::new(head_weight),
-        }
-    }
-
     pub fn forward(&self, x: &Tensor, start_pos: usize) -> Tensor {
         let mut h: Tensor;
         {

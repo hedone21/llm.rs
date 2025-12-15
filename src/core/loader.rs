@@ -125,8 +125,29 @@ impl Loader {
             let o = self.load_tensor(&tensors, &format!("{}.self_attn.o_proj.weight", p), true)?;
 
             // MLP 가중치 양자화 (가장 파라미터가 많음 -> 효과 큼)
-            let gate = self.load_tensor(&tensors, &format!("{}.mlp.gate_proj.weight", p), true)?;
-            let up = self.load_tensor(&tensors, &format!("{}.mlp.up_proj.weight", p), true)?;
+            // 1. Raw Data(F32) 상태로 읽기
+            let (gate_data, gate_shape) =
+                self.read_tensor(&tensors, &format!("{}.mlp.gate_proj.weight", p))?;
+            let (up_data, _up_shape) =
+                self.read_tensor(&tensors, &format!("{}.mlp.up_proj.weight", p))?;
+
+            // 2. 데이터 합치기: [Gate Rows] + [Up Rows]
+            // Gate Shape: [Inter, Hidden], Up Shape: [Inter, Hidden]
+            let inter_size = gate_shape.dims()[0];
+            let hidden_size = gate_shape.dims()[1];
+
+            let mut fused_data = gate_data; // Move gate_data
+            fused_data.extend(up_data); // Append up_data
+
+            // 3. 합쳐진 텐서 생성 및 양자화
+            let fused_shape = Shape::new(vec![inter_size * 2, hidden_size]);
+            let mut fused_tensor = Tensor::new(fused_data, fused_shape);
+            fused_tensor.set_name(&format!("{}.mlp.gate_up_fused", p));
+
+            // 4. Linear 레이어 생성 (Q4 양자화 적용)
+            let gate_up_proj = Linear::new(fused_tensor.quantize_q4());
+
+            // Down Proj는 기존대로 로드
             let down = self.load_tensor(&tensors, &format!("{}.mlp.down_proj.weight", p), true)?;
 
             // Norm은 파라미터가 적으므로 F32 유지 (정밀도 중요)
@@ -154,7 +175,7 @@ impl Loader {
                     config.num_heads,
                     cache,
                 ),
-                mlp: LlamaMLP::new(Linear::new(gate), Linear::new(up), Linear::new(down)),
+                mlp: LlamaMLP::new(gate_up_proj, Linear::new(down), config.intermediate_size),
                 input_norm: LlamaRMSNorm::new(input_norm, config.rms_norm_eps),
                 post_norm: LlamaRMSNorm::new(post_norm, config.rms_norm_eps),
             });

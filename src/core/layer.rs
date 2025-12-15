@@ -1,7 +1,7 @@
 use super::tensor::Tensor;
 use crate::{core::shape::Shape, profile};
 use log::*;
-use rayon::iter::{IntoParallelIterator, ParallelIterator};
+use rayon::prelude::*;
 use std::cell::RefCell;
 
 pub struct Linear {
@@ -17,23 +17,78 @@ impl Linear {
 }
 
 pub struct LlamaMLP {
-    pub gate_proj: Linear,
-    pub up_proj: Linear,
+    pub gate_up_proj: Linear, // Gate와 Up이 합쳐진 레이어
     pub down_proj: Linear,
+    pub intermediate_size: usize, // 반으로 쪼갤 위치
 }
 impl LlamaMLP {
-    pub fn new(gate: Linear, up: Linear, down: Linear) -> Self {
+    pub fn new(gate_up: Linear, down: Linear, intermediate_size: usize) -> Self {
         Self {
-            gate_proj: gate,
-            up_proj: up,
+            gate_up_proj: gate_up,
             down_proj: down,
+            intermediate_size,
         }
     }
+
     pub fn forward(&self, x: &Tensor) -> Tensor {
-        let mut gate = self.gate_proj.forward(x);
-        let up = self.up_proj.forward(x);
-        gate.silu_mul_inplace(&up);
-        self.down_proj.forward(&gate)
+        // 1. Fused Projection (Gate + Up 한번에 계산)
+        // 결과 Shape: [Seq, Intermediate * 2]
+        let fused = self.gate_up_proj.forward(x);
+        let src_data = fused.data(); // Read-only access
+
+        let seq_len = x.shape().dims()[0];
+        let mid = self.intermediate_size;
+
+        // 차원 검증 (디버깅용)
+        if src_data.len() != seq_len * mid * 2 {
+            panic!(
+                "MLP Size Mismatch: Seq={}, Inter={}, Expected={}, Got={}",
+                seq_len,
+                mid,
+                seq_len * mid * 2,
+                src_data.len()
+            );
+        }
+
+        // 2. Fused SiLU + Mul & Packing (Zero-Copy Logic)
+        // 결과를 저장할 버퍼를 미리 만듭니다 (크기: Seq * Intermediate)
+        // 기존의 불필요한 Up 데이터 공간을 제거하고 압축하여 저장합니다.
+        let mut result_data = vec![0.0; seq_len * mid];
+
+        // 값이 클수록 빨라지지만 멍청해질 수 있음. 0.01 ~ 0.05 추천
+        let threshold = 0.02;
+
+        // Rayon을 이용해 병렬 처리
+        // src(2*mid 크기)에서 읽어서 -> dst(mid 크기)에 씁니다.
+        result_data
+            .par_chunks_mut(mid)
+            .zip(src_data.par_chunks(mid * 2))
+            .for_each(|(dst, src)| {
+                // src는 [Gate... (mid개), Up... (mid개)] 형태로 되어 있음
+                let (gate, up) = src.split_at(mid);
+
+                // 루프 최적화 (Auto-Vectorization 유도)
+                for i in 0..mid {
+                    let g = gate[i];
+                    let u = up[i];
+                    let silu = g / (1.0 + (-g).exp());
+                    dst[i] = silu * u;
+
+                    // [핵심] 값이 너무 작으면 0으로 죽임 (Sparsity 유도)
+                    let val = silu * u;
+                    if val.abs() < threshold {
+                        dst[i] = 0.0;
+                    } else {
+                        dst[i] = val;
+                    }
+                }
+            });
+
+        // 3. Down Projection
+        // 압축된 데이터를 바로 Tensor로 포장 (복사 없음)
+        let input = Tensor::new(result_data, Shape::new(vec![seq_len, mid]));
+
+        self.down_proj.forward(&input)
     }
 }
 
