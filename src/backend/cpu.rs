@@ -477,14 +477,11 @@ impl CpuBackend {
                                 let narrowed = vmovn_s32(rounded);
 
                                 // Compact fallback for i16 -> i8 extraction
-                                let v0 = vget_lane_s16(narrowed, 0) as i8;
-                                let v1 = vget_lane_s16(narrowed, 1) as i8;
-                                let v2 = vget_lane_s16(narrowed, 2) as i8;
-                                let v3 = vget_lane_s16(narrowed, 3) as i8;
-                                *q_ptr.add(i * 4) = v0;
-                                *q_ptr.add(i * 4 + 1) = v1;
-                                *q_ptr.add(i * 4 + 2) = v2;
-                                *q_ptr.add(i * 4 + 3) = v3;
+                                // Note: Can't loop with const param in vget_lane
+                                *q_ptr.add(i * 4) = vget_lane_s16(narrowed, 0) as i8;
+                                *q_ptr.add(i * 4 + 1) = vget_lane_s16(narrowed, 1) as i8;
+                                *q_ptr.add(i * 4 + 2) = vget_lane_s16(narrowed, 2) as i8;
+                                *q_ptr.add(i * 4 + 3) = vget_lane_s16(narrowed, 3) as i8;
                             }
                         }
                     }
@@ -552,11 +549,11 @@ impl CpuBackend {
     }
 
     // -------------------------------------------------------------------------
-    // 3. ARM NEON Kernel (SDOT) - [NIGHTLY / FIXED]
+    // 3. ARM NEON Kernel (SDOT) - [FIXED LOOP & STRIDE]
     // -------------------------------------------------------------------------
     #[cfg(target_arch = "aarch64")]
     #[target_feature(enable = "neon")]
-    #[target_feature(enable = "dotprod")] // [중요] Nightly Feature
+    #[target_feature(enable = "dotprod")] // Nightly Feature
     unsafe fn kernel_neon_sdot(
         res_chunk: &mut [f32],
         start_col: usize,
@@ -579,9 +576,11 @@ impl CpuBackend {
 
             let mut total_sum = 0.0f32;
 
-            for _ in 0..(num_blocks / 2) {
-                let scale_1 = *s_b_ptr * *s_a_ptr;
-                let scale_2 = *s_b_ptr.add(1) * *s_a_ptr.add(1);
+            // [FIX] Iterate over ALL blocks (not num_blocks / 2)
+            // One iteration = 1 Block (32 weights)
+            for _ in 0..num_blocks {
+                // [FIX] Use 1 scale per block
+                let scale = *s_b_ptr * *s_a_ptr;
 
                 // Load Q4 (32 weights = 16 bytes)
                 let q4_raw = vld1q_u8(q4_ptr);
@@ -594,17 +593,16 @@ impl CpuBackend {
                 let w_low_s8 = vaddq_s8(vreinterpretq_s8_u8(v_low_u8), v_minus_8);
                 let w_high_s8 = vaddq_s8(vreinterpretq_s8_u8(v_high_u8), v_minus_8);
 
-                // 3. [FIX] Interleave Weights to match Activation order
-                // 기존 문제: Even/Odd 분리로 인한 순서 불일치 해결
+                // 3. Interleave Weights (w0..w15, w16..w31)
+                // vzip1 takes first half of interleaved, vzip2 takes second half
                 let w_0_15 = vzip1q_s8(w_low_s8, w_high_s8); // w0..w15
                 let w_16_31 = vzip2q_s8(w_low_s8, w_high_s8); // w16..w31
 
-                // Load Activations
-                let a_0 = vld1q_s8(q8_ptr); // a0..a15
+                // Load Activations (32 bytes = 2 vectors)
+                let a_0 = vld1q_s8(q8_ptr);       // a0..a15
                 let a_1 = vld1q_s8(q8_ptr.add(16)); // a16..a31
 
-                // 4. SDOT (Hardware Accelerated)
-                // vdotq_s32는 레지스터 내 4개 원소씩 곱합을 수행
+                // 4. SDOT
                 let mut acc = vdupq_n_s32(0);
                 acc = vdotq_s32(acc, w_0_15, a_0);
                 let sum1 = vaddvq_s32(acc) as f32;
@@ -613,12 +611,14 @@ impl CpuBackend {
                 acc2 = vdotq_s32(acc2, w_16_31, a_1);
                 let sum2 = vaddvq_s32(acc2) as f32;
 
-                total_sum += sum1 * scale_1 + sum2 * scale_2;
+                // [FIX] Apply 1 scale to the whole block result
+                total_sum += (sum1 + sum2) * scale;
 
-                q4_ptr = q4_ptr.add(32);
-                q8_ptr = q8_ptr.add(32);
-                s_b_ptr = s_b_ptr.add(2);
-                s_a_ptr = s_a_ptr.add(2);
+                // [FIX] Advance pointers correctly
+                q4_ptr = q4_ptr.add(16); // 16 bytes = 32 weights
+                q8_ptr = q8_ptr.add(32); // 32 bytes = 32 activations
+                s_b_ptr = s_b_ptr.add(1); // 1 scale per block
+                s_a_ptr = s_a_ptr.add(1); // 1 scale per block
             }
             *res = total_sum;
         }
