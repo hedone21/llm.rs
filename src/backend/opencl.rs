@@ -13,14 +13,17 @@ pub struct OpenClBackend {
 impl OpenClBackend {
     pub fn new() -> Self {
         let context = CL_CONTEXT.get_or_init(|| {
-            // [Phase 3] Full Offloading을 위한 커널 세트 추가
+            // [Step 2 Fix] matmul_q4_simd 커널의 시프트 연산 타입 수정 ((uchar4)(4))
             let src = r#"
+                #define TS 16
+
                 __kernel void add_dummy(__global float* a) {
                     int id = get_global_id(0);
                     a[id] += 1.0f;
                 }
 
-                __kernel void matmul(
+                // [Optimized] Tiled MatMul for F32
+                __kernel void matmul_tiled(
                     __global const float* A,
                     __global const float* B,
                     __global float* C,
@@ -28,19 +31,39 @@ impl OpenClBackend {
                     const int K,
                     const int N)
                 {
-                    int row = get_global_id(0);
-                    int col = get_global_id(1);
+                    const int row = get_local_id(0); 
+                    const int col = get_local_id(1); 
+                    const int globalRow = TS * get_group_id(0) + row; 
+                    const int globalCol = TS * get_group_id(1) + col; 
 
-                    if (row < M && col < N) {
-                        float sum = 0.0f;
-                        for (int k = 0; k < K; ++k) {
-                            sum += A[row * K + k] * B[k * N + col];
+                    __local float Asub[TS][TS];
+                    __local float Bsub[TS][TS];
+
+                    float acc = 0.0f;
+
+                    const int numTiles = K / TS;
+                    for (int t = 0; t < numTiles; t++) {
+                        const int tiledRow = TS * t + row;
+                        const int tiledCol = TS * t + col;
+                        
+                        Asub[row][col] = A[globalRow * K + tiledCol];
+                        Bsub[row][col] = B[tiledRow * N + globalCol];
+
+                        barrier(CLK_LOCAL_MEM_FENCE);
+
+                        for (int k = 0; k < TS; k++) {
+                            acc += Asub[row][k] * Bsub[k][col];
                         }
-                        C[row * N + col] = sum;
+                        barrier(CLK_LOCAL_MEM_FENCE);
+                    }
+                    
+                    if (globalRow < M && globalCol < N) {
+                        C[globalRow * N + globalCol] = acc;
                     }
                 }
 
-                __kernel void matmul_transposed(
+                // [Optimized] Tiled MatMul Transposed (A @ B^T)
+                __kernel void matmul_transposed_tiled(
                     __global const float* A,
                     __global const float* B,
                     __global float* C,
@@ -48,135 +71,150 @@ impl OpenClBackend {
                     const int K,
                     const int N)
                 {
-                    int row = get_global_id(0);
-                    int col = get_global_id(1);
+                    const int row = get_local_id(0);
+                    const int col = get_local_id(1);
+                    const int globalRow = TS * get_group_id(0) + row;
+                    const int globalCol = TS * get_group_id(1) + col;
 
-                    if (row < M && col < N) {
-                        float sum = 0.0f;
-                        for (int k = 0; k < K; ++k) {
-                            sum += A[row * K + k] * B[col * K + k];
+                    __local float Asub[TS][TS];
+                    __local float Bsub[TS][TS];
+
+                    float acc = 0.0f;
+
+                    const int numTiles = K / TS;
+                    for (int t = 0; t < numTiles; t++) {
+                        const int tiledCol = TS * t + col; 
+                        const int tiledColB = TS * t + row; 
+
+                        Asub[row][col] = A[globalRow * K + (TS * t + col)];
+                        Bsub[row][col] = B[globalCol * K + (TS * t + row)]; 
+
+                        barrier(CLK_LOCAL_MEM_FENCE);
+
+                        for (int k = 0; k < TS; k++) {
+                            acc += Asub[row][k] * Bsub[col][k];
                         }
-                        C[row * N + col] = sum;
+                        barrier(CLK_LOCAL_MEM_FENCE);
+                    }
+
+                    if (globalRow < M && globalCol < N) {
+                        C[globalRow * N + globalCol] = acc;
                     }
                 }
 
-                // [New] In-place Add: A += B
+                // [Optimized] Q4 MatMul (SIMD + Loop Unrolling)
+                __kernel void matmul_q4_simd(
+                    __global const float* A,
+                    __global const uchar* B_data,
+                    __global float* C,
+                    const int M, 
+                    const int K, 
+                    const int N,
+                    const int offset_scales)
+                {
+                    int row = get_global_id(0); 
+                    int col = get_global_id(1); 
+
+                    __global const float* B_scales = (__global const float*)(B_data + offset_scales);
+
+                    if (row < M && col < N) {
+                        float4 sum_vec = (float4)(0.0f); 
+                        
+                        int b_row_offset = col * (K / 2); 
+                        int s_row_offset = col * (K / 32); 
+
+                        __global const uchar* my_b_data = B_data + b_row_offset;
+                        __global const float* my_b_scales = B_scales + s_row_offset;
+                        __global const float* my_a_row = A + row * K;
+                        
+                        int num_blocks = K / 32;
+                        
+                        for (int b = 0; b < num_blocks; b++) {
+                            float scale = my_b_scales[b];
+                            
+                            int base_idx = b * 16;    
+                            int a_base_idx = b * 32;   
+
+                            for (int i = 0; i < 4; i++) {
+                                uchar4 packed = vload4(0, my_b_data + base_idx + i * 4);
+                                
+                                float4 a1 = vload4(0, my_a_row + a_base_idx + i * 8);
+                                float4 a2 = vload4(0, my_a_row + a_base_idx + i * 8 + 4);
+
+                                // Lower nibbles
+                                float4 w1 = convert_float4(packed & (uchar4)(0x0F)) - 8.0f;
+                                // Upper nibbles [FIX: Explicit cast for shift]
+                                float4 w2 = convert_float4(packed >> (uchar4)(4)) - 8.0f;
+
+                                sum_vec.x += a1.x * (w1.x * scale);
+                                sum_vec.y += a1.y * (w2.x * scale);
+                                
+                                sum_vec.z += a1.z * (w1.y * scale);
+                                sum_vec.w += a1.w * (w2.y * scale);
+                                
+                                sum_vec.x += a2.x * (w1.z * scale);
+                                sum_vec.y += a2.y * (w2.z * scale);
+                                
+                                sum_vec.z += a2.z * (w1.w * scale);
+                                sum_vec.w += a2.w * (w2.w * scale);
+                            }
+                        }
+                        C[row * N + col] = sum_vec.x + sum_vec.y + sum_vec.z + sum_vec.w;
+                    }
+                }
+                
                 __kernel void add_assign(__global float* a, __global const float* b, const int n) {
-                    int i = get_global_id(0);
-                    if (i < n) {
-                        a[i] += b[i];
-                    }
+                    int i = get_global_id(0); if (i < n) a[i] += b[i];
                 }
-
-                // [New] SiLU * Mul: Gate = (Gate / (1 + exp(-Gate))) * Up
                 __kernel void silu_mul(__global float* gate, __global const float* up, const int n) {
                     int i = get_global_id(0);
                     if (i < n) {
                         float g = gate[i];
-                        float silu = g / (1.0f + exp(-g));
-                        gate[i] = silu * up[i];
+                        gate[i] = (g / (1.0f + exp(-g))) * up[i];
                     }
                 }
-
-                // [New] Scalar Scale: x *= val
                 __kernel void scale(__global float* x, const float val, const int n) {
-                    int i = get_global_id(0);
-                    if (i < n) {
-                        x[i] *= val;
-                    }
+                    int i = get_global_id(0); if (i < n) x[i] *= val;
                 }
-
-                // [New] RMS Norm
-                // 간단한 구현: 1 Thread per Row (병렬성은 Row 개수만큼)
-                __kernel void rms_norm(
-                    __global const float* x,
-                    __global const float* weight,
-                    __global float* out,
-                    const int row_stride, // Hidden Size
-                    const float eps)
-                {
+                __kernel void rms_norm(__global const float* x, __global const float* w, __global float* out, const int stride, const float eps) {
                     int row = get_global_id(0);
-                    int offset = row * row_stride;
-
+                    int offset = row * stride;
                     float ss = 0.0f;
-                    for (int i = 0; i < row_stride; i++) {
-                        float v = x[offset + i];
-                        ss += v * v;
-                    }
-                    
-                    float rms = sqrt(ss / (float)row_stride + eps);
-                    float scale = 1.0f / rms;
-
-                    for (int i = 0; i < row_stride; i++) {
-                        out[offset + i] = x[offset + i] * scale * weight[i];
-                    }
+                    for (int i=0; i<stride; i++) ss += x[offset+i] * x[offset+i];
+                    float rms = sqrt(ss / stride + eps);
+                    float s = 1.0f / rms;
+                    for (int i=0; i<stride; i++) out[offset+i] = x[offset+i] * s * w[i];
                 }
-
-                // [New] Softmax
-                // 간단한 구현: 1 Thread per Row
-                __kernel void softmax(
-                    __global const float* x,
-                    __global float* out,
-                    const int row_stride)
-                {
+                __kernel void softmax(__global const float* x, __global float* out, const int stride) {
                     int row = get_global_id(0);
-                    int offset = row * row_stride;
-
-                    // 1. Max (for stability)
-                    float max_val = -1e30f; // -infinity
-                    for (int i = 0; i < row_stride; i++) {
-                        float v = x[offset + i];
-                        if (v > max_val) max_val = v;
+                    int offset = row * stride;
+                    float max_v = -1e30f;
+                    for(int i=0; i<stride; i++) if(x[offset+i] > max_v) max_v = x[offset+i];
+                    float sum = 0.0f;
+                    for(int i=0; i<stride; i++) {
+                        float e = exp(x[offset+i] - max_v);
+                        out[offset+i] = e;
+                        sum += e;
                     }
-
-                    // 2. Exp Sum
-                    float sum_exp = 0.0f;
-                    for (int i = 0; i < row_stride; i++) {
-                        float e = exp(x[offset + i] - max_val);
-                        out[offset + i] = e; // 임시 저장
-                        sum_exp += e;
-                    }
-
-                    // 3. Normalize
-                    float inv_sum = 1.0f / sum_exp;
-                    for (int i = 0; i < row_stride; i++) {
-                        out[offset + i] *= inv_sum;
-                    }
+                    float inv = 1.0f / sum;
+                    for(int i=0; i<stride; i++) out[offset+i] *= inv;
                 }
-
-                // [New] RoPE (Rotary Positional Embedding)
-                // x: [Seq, HeadDim] (Flat)
-                // Thread는 (Seq * HeadDim / 2) 만큼 실행
-                __kernel void rope_inplace(
-                    __global float* x,
-                    const int start_pos,
-                    const int head_dim,
-                    const float theta_base)
-                {
+                __kernel void rope_inplace(__global float* x, const int start, const int dim, const float base) {
                     int gid = get_global_id(0);
-                    
-                    int mid = head_dim / 2;
-                    int row = gid / mid;      // Sequence Index
-                    int j = gid % mid;        // Pair Index (0 ~ mid-1)
-
-                    int pos = start_pos + row;
-                    
-                    // Frequency Calculation
-                    float freq_idx = ((float)j * 2.0f) / (float)head_dim;
-                    float theta = 1.0f / pow(theta_base, freq_idx);
+                    int mid = dim / 2;
+                    int row = gid / mid;
+                    int j = gid % mid;
+                    int pos = start + row;
+                    float freq = ((float)j * 2.0f) / (float)dim;
+                    float theta = 1.0f / pow(base, freq);
                     float m_theta = (float)pos * theta;
-                    
-                    float sin_val = sin(m_theta);
-                    float cos_val = cos(m_theta);
-
-                    int idx_re = row * head_dim + j;
-                    int idx_im = idx_re + mid;
-
-                    float re = x[idx_re];
-                    float im = x[idx_im];
-
-                    x[idx_re] = re * cos_val - im * sin_val;
-                    x[idx_im] = re * sin_val + im * cos_val;
+                    float s = sin(m_theta);
+                    float c = cos(m_theta);
+                    int idx = row * dim + j;
+                    float re = x[idx];
+                    float im = x[idx + mid];
+                    x[idx] = re * c - im * s;
+                    x[idx + mid] = re * s + im * c;
                 }
             "#;
 
@@ -186,10 +224,7 @@ impl OpenClBackend {
                 .build()
                 .expect("Failed to initialize OpenCL");
 
-            println!(
-                "[OpenCL] Initialized on: {}",
-                pro_que.device().name().unwrap_or("Unknown".into())
-            );
+            println!("[OpenCL] Optimized Kernels Loaded (TS=16, SIMD)");
             Arc::new(pro_que)
         });
 
@@ -198,30 +233,42 @@ impl OpenClBackend {
         }
     }
 
-    pub fn allocate_shared(&self, shape: &Shape) -> Tensor {
-        // (Phase 1, 2와 동일)
-        let count = shape.num_elements();
-        let size_bytes = count * 4;
+    pub fn allocate_shared_q4(&self, shape: &Shape, data_len: usize, scale_len: usize) -> Tensor {
+        let total_bytes = data_len + (scale_len * 4);
+        let buffer = Buffer::<u8>::builder()
+            .queue(self.context.queue().clone())
+            .flags(flags::MEM_READ_WRITE | flags::MEM_ALLOC_HOST_PTR)
+            .len(total_bytes)
+            .build()
+            .expect("Q4 Alloc Failed");
+        let ptr = unsafe { buffer.map().enq().expect("Map Failed").as_mut_ptr() };
+        Tensor::from_storage(
+            Storage::SharedQ4 {
+                ptr,
+                size: total_bytes,
+                cl_buffer: Some(buffer),
+                queue: Some(self.context.queue().clone()),
+                data_len,
+                scale_len,
+            },
+            shape.clone(),
+            Device::OpenCl,
+        )
+    }
 
+    pub fn allocate_shared(&self, shape: &Shape) -> Tensor {
+        let count = shape.num_elements();
         let buffer = Buffer::<f32>::builder()
             .queue(self.context.queue().clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_ALLOC_HOST_PTR)
             .len(count)
             .build()
-            .expect("Failed to allocate shared buffer");
-
-        let ptr = unsafe {
-            buffer
-                .map()
-                .enq()
-                .expect("Failed to map buffer")
-                .as_mut_ptr()
-        };
-
+            .expect("Alloc Failed");
+        let ptr = unsafe { buffer.map().enq().expect("Map Failed").as_mut_ptr() };
         Tensor::from_storage(
             Storage::Shared {
                 ptr: ptr as *mut u8,
-                size: size_bytes,
+                size: count * 4,
                 cl_buffer: Some(buffer),
                 queue: Some(self.context.queue().clone()),
                 handle: 0,
@@ -231,128 +278,109 @@ impl OpenClBackend {
         )
     }
 
-    pub fn launch_dummy_kernel(&self, tensor: &Tensor) {
-        if let Storage::Shared {
-            cl_buffer: Some(buffer),
-            ..
-        } = &*tensor.storage
-        {
-            let kernel = self
-                .context
-                .kernel_builder("add_dummy")
-                .arg(buffer)
-                .global_work_size(tensor.shape().num_elements())
-                .build()
-                .expect("Failed to build dummy kernel");
-            unsafe {
-                kernel.enq().expect("Failed to enqueue kernel");
-            }
-            self.context
-                .queue()
-                .finish()
-                .expect("Failed to finish queue");
-        }
-    }
-
     fn get_buffer<'a>(&self, tensor: &'a Tensor) -> &'a Buffer<f32> {
         match &*tensor.storage {
             Storage::Shared {
-                cl_buffer: Some(buf),
-                ..
-            } => buf,
-            Storage::OpenCl(buf) => buf,
-            _ => panic!("Tensor must be on OpenCL device (Shared or OpenCl)"),
+                cl_buffer: Some(b), ..
+            } => b,
+            Storage::OpenCl(b) => b,
+            _ => panic!("Not OpenCL F32 Tensor"),
         }
     }
-}
 
-impl Backend for OpenClBackend {
-    fn device(&self) -> Device {
-        Device::OpenCl
-    }
-    fn name(&self) -> &str {
-        "ARM OpenCL (Zero-Copy)"
-    }
-
-    // [Phase 2]
-    fn matmul(&self, a: &Tensor, b: &Tensor) -> Tensor {
+    fn matmul_dispatch(&self, a: &Tensor, b: &Tensor, transpose_b: bool) -> Tensor {
         let dim_a = a.shape().dims();
         let dim_b = b.shape().dims();
         let (m, k) = (dim_a[0], dim_a[1]);
-        let (k2, n) = (dim_b[0], dim_b[1]);
-        assert_eq!(k, k2, "Matmul dimension mismatch");
+        let (n, k2) = if transpose_b {
+            (dim_b[0], dim_b[1])
+        } else {
+            (dim_b[1], dim_b[0])
+        };
+        assert_eq!(k, k2, "Dim mismatch");
 
         let c = self.allocate_shared(&Shape::new(vec![m, n]));
-        let buf_a = self.get_buffer(a);
-        let buf_b = self.get_buffer(b);
-        let buf_c = self.get_buffer(&c);
 
-        let kernel = self
-            .context
-            .kernel_builder("matmul")
-            .arg(buf_a)
-            .arg(buf_b)
-            .arg(buf_c)
-            .arg(m as i32)
-            .arg(k as i32)
-            .arg(n as i32)
-            .global_work_size([m, n])
-            .build()
-            .expect("Failed to build matmul");
-        unsafe {
-            kernel.enq().expect("Failed to enq");
+        match (&*a.storage, &*b.storage) {
+            (Storage::Shared { .. }, Storage::Shared { .. })
+            | (Storage::OpenCl(_), Storage::OpenCl(_)) => {
+                let name = if transpose_b {
+                    "matmul_transposed_tiled"
+                } else {
+                    "matmul_tiled"
+                };
+                let buf_a = self.get_buffer(a);
+                let buf_b = self.get_buffer(b);
+                let buf_c = self.get_buffer(&c);
+
+                let kernel = self
+                    .context
+                    .kernel_builder(name)
+                    .arg(buf_a)
+                    .arg(buf_b)
+                    .arg(buf_c)
+                    .arg(m as i32)
+                    .arg(k as i32)
+                    .arg(n as i32)
+                    .global_work_size([((m + 15) / 16) * 16, ((n + 15) / 16) * 16])
+                    .local_work_size([16, 16])
+                    .build()
+                    .unwrap();
+
+                unsafe {
+                    kernel.enq().unwrap();
+                }
+                self.context.queue().finish().unwrap();
+            }
+
+            (
+                Storage::Shared { .. },
+                Storage::SharedQ4 {
+                    cl_buffer,
+                    data_len,
+                    ..
+                },
+            ) => {
+                if !transpose_b {
+                    panic!("Q4 only supports transposed B");
+                }
+
+                let buf_a = self.get_buffer(a);
+                let buf_b_raw = cl_buffer.as_ref().unwrap();
+                let buf_c = self.get_buffer(&c);
+
+                let kernel = self
+                    .context
+                    .kernel_builder("matmul_q4_simd")
+                    .arg(buf_a)
+                    .arg(buf_b_raw)
+                    .arg(buf_c)
+                    .arg(m as i32)
+                    .arg(k as i32)
+                    .arg(n as i32)
+                    .arg(*data_len as i32)
+                    .global_work_size([m, n])
+                    .build()
+                    .expect("Build Q4 SIMD failed");
+
+                unsafe {
+                    kernel.enq().expect("Enq Q4 SIMD failed");
+                }
+                self.context
+                    .queue()
+                    .finish()
+                    .expect("Finish Q4 SIMD failed");
+            }
+            _ => panic!("Storage mismatch"),
         }
-        self.context.queue().finish().expect("Failed to finish");
         c
     }
 
-    // [Phase 2]
-    fn matmul_transposed(&self, a: &Tensor, b: &Tensor) -> Tensor {
-        let dim_a = a.shape().dims();
-        let dim_b = b.shape().dims();
-        let (m, k) = (dim_a[0], dim_a[1]);
-        let (n, k2) = (dim_b[0], dim_b[1]);
-        assert_eq!(k, k2, "Matmul T mismatch");
-
-        let c = self.allocate_shared(&Shape::new(vec![m, n]));
-        let buf_a = self.get_buffer(a);
-        let buf_b = self.get_buffer(b);
-        let buf_c = self.get_buffer(&c);
-
-        let kernel = self
-            .context
-            .kernel_builder("matmul_transposed")
-            .arg(buf_a)
-            .arg(buf_b)
-            .arg(buf_c)
-            .arg(m as i32)
-            .arg(k as i32)
-            .arg(n as i32)
-            .global_work_size([m, n])
-            .build()
-            .expect("Failed to build matmul_transposed");
-        unsafe {
-            kernel.enq().expect("Failed to enq");
-        }
-        self.context.queue().finish().expect("Failed to finish");
-        c
-    }
-
-    // [Phase 3] CPU Fallback for Slice Ops
-    fn matmul_slice(&self, a: &Tensor, other_data: &[f32], rows: usize, cols: usize) -> Tensor {
-        // GPU 텐서 a는 Shared Memory이므로, CPU에서도 접근 가능합니다.
-        // Slice는 버퍼 핸들이 없으므로 커널에 전달하기 어렵습니다.
-        // 따라서 CPU Fallback을 사용합니다 (Shared Memory 덕분에 복사 비용 없음).
+    pub fn matmul_slice(&self, a: &Tensor, other_data: &[f32], rows: usize, cols: usize) -> Tensor {
         let dims_a = a.shape().dims();
         let (m, k) = (dims_a[0], dims_a[1]);
-        assert_eq!(k, cols, "MatMul Slice mismatch");
-
         let mut result_data = vec![0.0; m * rows];
-
-        // Zero-Copy Access
         let a_data = a.data();
-
-        // Simple CPU MatMul
         for i in 0..m {
             let a_row = &a_data[i * k..(i + 1) * k];
             for j in 0..rows {
@@ -361,206 +389,177 @@ impl Backend for OpenClBackend {
                 result_data[i * rows + j] = sum;
             }
         }
-
-        // 결과도 Shared Tensor로 반환
-        let mut res_tensor = self.allocate_shared(&Shape::new(vec![m, rows]));
+        let mut res = self.allocate_shared(&Shape::new(vec![m, rows]));
         unsafe {
-            // Memory Copy (CPU -> Shared)
             std::ptr::copy_nonoverlapping(
                 result_data.as_ptr(),
-                res_tensor.data_mut().as_mut_ptr(),
+                res.data_mut().as_mut_ptr(),
                 result_data.len(),
             );
         }
-        res_tensor
+        res
     }
 
-    // [Phase 3] In-place Add
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) {
         let n = a.shape().num_elements();
-        assert_eq!(n, b.shape().num_elements(), "Shape mismatch add_assign");
-
-        let buf_a = self.get_buffer(a);
-        let buf_b = self.get_buffer(b);
-
-        let kernel = self
+        let ka = self
             .context
             .kernel_builder("add_assign")
-            .arg(buf_a)
-            .arg(buf_b)
+            .arg(self.get_buffer(a))
+            .arg(self.get_buffer(b))
             .arg(n as i32)
             .global_work_size(n)
             .build()
-            .expect("Failed to build add_assign");
-
+            .unwrap();
         unsafe {
-            kernel.enq().expect("Failed to enq add_assign");
+            ka.enq().unwrap();
         }
-        self.context.queue().finish().expect("Failed to finish");
+        self.context.queue().finish().unwrap();
     }
-
-    // [Phase 3] SiLU * Mul
-    fn silu_mul(&self, gate: &mut Tensor, up: &Tensor) {
-        let n = gate.shape().num_elements();
-        assert_eq!(n, up.shape().num_elements());
-
-        let buf_g = self.get_buffer(gate);
-        let buf_u = self.get_buffer(up);
-
-        let kernel = self
+    fn silu_mul(&self, g: &mut Tensor, u: &Tensor) {
+        let n = g.shape().num_elements();
+        let k = self
             .context
             .kernel_builder("silu_mul")
-            .arg(buf_g)
-            .arg(buf_u)
+            .arg(self.get_buffer(g))
+            .arg(self.get_buffer(u))
             .arg(n as i32)
             .global_work_size(n)
             .build()
-            .expect("Failed to build silu_mul");
-
+            .unwrap();
         unsafe {
-            kernel.enq().expect("Failed to enq silu_mul");
+            k.enq().unwrap();
         }
-        self.context.queue().finish().expect("Failed to finish");
+        self.context.queue().finish().unwrap();
     }
-
-    // [Phase 3] RoPE
-    fn rope_inplace(&self, x: &mut Tensor, start_pos: usize) {
+    fn rope_inplace(&self, x: &mut Tensor, start: usize) {
         let dims = x.shape().dims();
-        // x shape assumption: [Seq, HeadDim] (flattened from [Heads, Seq, HeadDim] in previous steps)
-        // Or simply num_elements / head_dim (since RoPE is applied to last dim)
-        let head_dim = *dims.last().unwrap();
-        let total_elements = x.shape().num_elements();
-        let seq_len = total_elements / head_dim; // Total tokens involved (Batch * Heads * Seq)
-
-        // Work items: Total Pairs to rotate
-        let total_pairs = total_elements / 2;
-
-        let buf_x = self.get_buffer(x);
-        let theta_base = 500_000.0f32;
-
-        let kernel = self
+        let hd = *dims.last().unwrap();
+        let n = x.shape().num_elements() / 2;
+        let k = self
             .context
             .kernel_builder("rope_inplace")
-            .arg(buf_x)
-            .arg(start_pos as i32)
-            .arg(head_dim as i32)
-            .arg(theta_base)
-            .global_work_size(total_pairs)
+            .arg(self.get_buffer(x))
+            .arg(start as i32)
+            .arg(hd as i32)
+            .arg(500000.0f32)
+            .global_work_size(n)
             .build()
-            .expect("Failed to build rope_inplace");
-
+            .unwrap();
         unsafe {
-            kernel.enq().expect("Failed to enq rope");
+            k.enq().unwrap();
         }
-        self.context.queue().finish().expect("Failed to finish");
+        self.context.queue().finish().unwrap();
     }
-
-    // [Phase 3] RMS Norm
-    fn rms_norm(&self, x: &Tensor, weight: &Tensor, eps: f32) -> Tensor {
+    fn rms_norm(&self, x: &Tensor, w: &Tensor, eps: f32) -> Tensor {
         let dims = x.shape().dims();
-        let row_stride = *dims.last().unwrap();
-        let num_rows = x.shape().num_elements() / row_stride;
-
+        let stride = *dims.last().unwrap();
+        let rows = x.shape().num_elements() / stride;
         let out = self.allocate_shared(x.shape());
-
-        let buf_x = self.get_buffer(x);
-        let buf_w = self.get_buffer(weight);
-        let buf_out = self.get_buffer(&out);
-
-        let kernel = self
+        let k = self
             .context
             .kernel_builder("rms_norm")
-            .arg(buf_x)
-            .arg(buf_w)
-            .arg(buf_out)
-            .arg(row_stride as i32)
+            .arg(self.get_buffer(x))
+            .arg(self.get_buffer(w))
+            .arg(self.get_buffer(&out))
+            .arg(stride as i32)
             .arg(eps)
-            .global_work_size(num_rows) // 1 Thread per Row
+            .global_work_size(rows)
             .build()
-            .expect("Failed to build rms_norm");
-
+            .unwrap();
         unsafe {
-            kernel.enq().expect("Failed to enq rms_norm");
+            k.enq().unwrap();
         }
-        self.context.queue().finish().expect("Failed to finish");
+        self.context.queue().finish().unwrap();
         out
     }
-
-    // [Phase 3] Softmax
     fn softmax(&self, x: &Tensor) -> Tensor {
         let dims = x.shape().dims();
-        let row_stride = *dims.last().unwrap();
-        let num_rows = x.shape().num_elements() / row_stride;
-
+        let stride = *dims.last().unwrap();
+        let rows = x.shape().num_elements() / stride;
         let out = self.allocate_shared(x.shape());
-
-        let buf_x = self.get_buffer(x);
-        let buf_out = self.get_buffer(&out);
-
-        let kernel = self
+        let k = self
             .context
             .kernel_builder("softmax")
-            .arg(buf_x)
-            .arg(buf_out)
-            .arg(row_stride as i32)
-            .global_work_size(num_rows) // 1 Thread per Row
+            .arg(self.get_buffer(x))
+            .arg(self.get_buffer(&out))
+            .arg(stride as i32)
+            .global_work_size(rows)
             .build()
-            .expect("Failed to build softmax");
-
+            .unwrap();
         unsafe {
-            kernel.enq().expect("Failed to enq softmax");
+            k.enq().unwrap();
         }
-        self.context.queue().finish().expect("Failed to finish");
+        self.context.queue().finish().unwrap();
         out
     }
-
-    // [Phase 3] Scale
-    fn scale(&self, x: &Tensor, value: f32) -> Tensor {
-        // 1. 결과 텐서 할당
-        let mut out = self.allocate_shared(x.shape());
+    fn scale(&self, x: &Tensor, v: f32) -> Tensor {
+        let out = self.copy_from(x);
         let n = x.shape().num_elements();
-
-        // 2. [데이터 복사] CPU -> Shared Memory (Zero-Copy)
-        // 먼저 데이터를 복사합니다. 이때는 out의 Mutable borrow가 필요합니다.
-        unsafe {
-            let src = x.data();
-            let dst = out.data_mut(); // Mutable borrow 발생
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), n);
-        } // Mutable borrow 종료
-
-        // 3. [버퍼 획득]
-        // 데이터 복사가 끝났으므로 이제 안전하게 불변 참조(Buffer)를 얻을 수 있습니다.
-        let buf_out = self.get_buffer(&out);
-
-        // 4. [커널 실행] In-place Scaling
-        let kernel = self
+        let k = self
             .context
             .kernel_builder("scale")
-            .arg(buf_out) // In-place on 'out'
-            .arg(value)
+            .arg(self.get_buffer(&out))
+            .arg(v)
             .arg(n as i32)
             .global_work_size(n)
             .build()
-            .expect("Failed to build scale");
-
+            .unwrap();
         unsafe {
-            kernel.enq().expect("Failed to enq scale");
+            k.enq().unwrap();
         }
-        self.context.queue().finish().expect("Failed to finish");
-
+        self.context.queue().finish().unwrap();
         out
     }
-
-    // [Phase 3] Copy From
-    fn copy_from(&self, tensor: &Tensor) -> Tensor {
-        // Deep copy
-        let mut out = self.allocate_shared(tensor.shape());
-        let n = tensor.shape().num_elements();
+    fn copy_from(&self, t: &Tensor) -> Tensor {
+        let mut out = self.allocate_shared(t.shape());
         unsafe {
-            let src = tensor.data();
-            let dst = out.data_mut();
-            std::ptr::copy_nonoverlapping(src.as_ptr(), dst.as_mut_ptr(), n);
+            std::ptr::copy_nonoverlapping(
+                t.data().as_ptr(),
+                out.data_mut().as_mut_ptr(),
+                t.shape().num_elements(),
+            );
         }
         out
+    }
+    pub fn launch_dummy_kernel(&self, t: &Tensor) {}
+}
+
+impl Backend for OpenClBackend {
+    fn device(&self) -> Device {
+        Device::OpenCl
+    }
+    fn name(&self) -> &str {
+        "ARM OpenCL (Tiled+SIMD)"
+    }
+    fn matmul(&self, a: &Tensor, b: &Tensor) -> Tensor {
+        self.matmul_dispatch(a, b, false)
+    }
+    fn matmul_transposed(&self, a: &Tensor, b: &Tensor) -> Tensor {
+        self.matmul_dispatch(a, b, true)
+    }
+    fn matmul_slice(&self, a: &Tensor, d: &[f32], r: usize, c: usize) -> Tensor {
+        self.matmul_slice(a, d, r, c)
+    }
+    fn add_assign(&self, a: &mut Tensor, b: &Tensor) {
+        self.add_assign(a, b)
+    }
+    fn silu_mul(&self, g: &mut Tensor, u: &Tensor) {
+        self.silu_mul(g, u)
+    }
+    fn rope_inplace(&self, x: &mut Tensor, s: usize) {
+        self.rope_inplace(x, s)
+    }
+    fn rms_norm(&self, x: &Tensor, w: &Tensor, e: f32) -> Tensor {
+        self.rms_norm(x, w, e)
+    }
+    fn softmax(&self, x: &Tensor) -> Tensor {
+        self.softmax(x)
+    }
+    fn scale(&self, x: &Tensor, v: f32) -> Tensor {
+        self.scale(x, v)
+    }
+    fn copy_from(&self, t: &Tensor) -> Tensor {
+        self.copy_from(t)
     }
 }

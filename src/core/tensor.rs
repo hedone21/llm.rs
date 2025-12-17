@@ -14,13 +14,23 @@ pub enum Storage {
         data: Vec<u8>,
         scales: Vec<f32>,
     },
-    // [수정] Shared Variant에 queue 필드 추가
     Shared {
         ptr: *mut u8,
         handle: usize,
         size: usize,
         cl_buffer: Option<Buffer<f32>>,
         queue: Option<Queue>, // Unmap을 위해 큐 보관
+    },
+    SharedQ4 {
+        // 단일 버퍼에 [Data | Scales] 순서로 패킹하여 저장
+        ptr: *mut u8,
+        size: usize,
+        cl_buffer: Option<Buffer<u8>>, // Raw Bytes 컨테이너
+        queue: Option<Queue>,
+
+        // 메타데이터
+        data_len: usize,  // Q4 데이터 바이트 길이
+        scale_len: usize, // Scale 데이터 바이트 길이 (실제 크기는 * 4)
     },
     OpenCl(Buffer<f32>),
     QnnTensor(usize),
@@ -133,6 +143,9 @@ impl Tensor {
             Storage::Shared { ptr, size, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr as *const f32, size / 4)
             },
+            Storage::SharedQ4 { .. } => {
+                panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
+            }
             Storage::OpenCl(_) => {
                 panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
             }
@@ -147,6 +160,9 @@ impl Tensor {
                 Storage::Shared { ptr, size, .. } => unsafe {
                     std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
                 },
+                Storage::SharedQ4 { .. } => {
+                    panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
+                }
                 Storage::OpenCl(_) => {
                     panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
                 }
@@ -195,46 +211,30 @@ impl Tensor {
             }
 
             // 3. CpuQ4 -> OpenCl (Dequantize & Upload)
-            // [중요] GPU는 현재 F32 커널만 지원하므로, 여기서 압축을 풉니다.
             (Storage::CpuQ4 { data, scales }, Device::OpenCl) => {
-                {
-                    use crate::backend::opencl::OpenClBackend;
-                    let backend = OpenClBackend::new();
-                    let new_tensor = backend.allocate_shared(&self.shape);
+                use crate::backend::opencl::OpenClBackend;
+                let backend = OpenClBackend::new();
 
-                    let dst = unsafe {
-                        match &*new_tensor.storage {
-                            Storage::Shared { ptr, size, .. } => {
-                                std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
-                            }
-                            _ => unreachable!(),
-                        }
-                    };
+                // Q4용 Shared Buffer 할당 (백엔드에 요청)
+                let new_tensor = backend.allocate_shared_q4(&self.shape, data.len(), scales.len());
 
-                    // Dequantize Loop (8.0 Offset Fix)
-                    let block_size = 32;
-                    let mut d_idx = 0;
-                    for (i, &scale) in scales.iter().enumerate() {
-                        let chunk_start = i * (block_size / 2);
-                        let chunk_end = (chunk_start + (block_size / 2)).min(data.len());
+                match &*new_tensor.storage {
+                    Storage::SharedQ4 { ptr, data_len, .. } => {
+                        unsafe {
+                            let base_ptr = *ptr;
 
-                        for &packed in &data[chunk_start..chunk_end] {
-                            let low = (packed & 0x0F) as f32;
-                            let high = (packed >> 4) as f32;
+                            // 1. Q4 Data Copy
+                            std::ptr::copy_nonoverlapping(data.as_ptr(), base_ptr, data.len());
 
-                            // [Fix] 8.5 -> 8.0 (Correct Offset)
-                            if d_idx < dst.len() {
-                                dst[d_idx] = (low - 8.0) * scale;
-                                d_idx += 1;
-                            }
-                            if d_idx < dst.len() {
-                                dst[d_idx] = (high - 8.0) * scale;
-                                d_idx += 1;
-                            }
+                            // 2. Scales Copy (Data 뒤에 이어서 붙임)
+                            // scales는 f32이므로 바이트 단위로 포인터 이동 후 복사
+                            let scale_ptr = base_ptr.add(*data_len) as *mut f32;
+                            std::ptr::copy_nonoverlapping(scales.as_ptr(), scale_ptr, scales.len());
                         }
                     }
-                    new_tensor
+                    _ => unreachable!("Must be SharedQ4"),
                 }
+                new_tensor
             }
 
             // 4. Fallback (OpenCl -> Cpu Copy)
