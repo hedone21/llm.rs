@@ -2,6 +2,7 @@ use super::shape::Shape;
 use std::sync::Arc;
 // backend 모듈과 backend_impl 모듈이 core에 있다고 가정합니다.
 use crate::backend::cpu::CpuBackend;
+use crate::backend::opencl::OpenClBackend;
 use crate::backend::{Backend, Device};
 
 use ocl::{Buffer, Queue};
@@ -257,6 +258,7 @@ impl Tensor {
     fn backend(&self) -> Box<dyn Backend> {
         match self.device {
             Device::Cpu => Box::new(CpuBackend),
+            Device::OpenCl => Box::new(OpenClBackend::new()),
             _ => unimplemented!("Backend for device not implemented"),
         }
     }
@@ -291,6 +293,12 @@ impl Tensor {
 
     // In-Place Add
     pub fn add_assign(&mut self, other: &Tensor) {
+        if self.device != other.device {
+            let other_dev = other.to_device(self.device);
+            self.backend().add_assign(self, &other_dev);
+            return;
+        }
+
         // 백엔드에서 In-Place 수정
         self.backend().add_assign(self, other);
     }

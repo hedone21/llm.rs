@@ -42,9 +42,13 @@ impl Backend for CpuBackend {
 
         let mut result_data = vec![0.0; m * n];
 
+        // [수정] A 데이터 접근 시 Shared 타입도 지원하도록 변경
         let a_data = match &*a.storage {
-            Storage::Cpu(d) => d,
-            _ => panic!("Input A must be F32"),
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
+            _ => panic!("Input A must be F32 (Cpu or Shared)"),
         };
 
         match &*b.storage {
@@ -53,10 +57,10 @@ impl Backend for CpuBackend {
                 data: b_q,
                 scales: b_s,
             } => {
+                // ... (기존 Q4 구현 코드 그대로 유지) ...
                 let block_size = 32;
                 let num_blocks = k / block_size;
 
-                // (A) Decoding / Batch=1 (Optimized Path)
                 if m == 1 {
                     let mut a_q8 = vec![0i8; k];
                     let mut a_scales = vec![0.0f32; num_blocks];
@@ -71,14 +75,11 @@ impl Backend for CpuBackend {
                             );
                         },
                     );
-                }
-                // (B) Prefill / Batch > 1 (Row-wise Parallel)
-                else {
+                } else {
                     result_data
                         .par_chunks_mut(n)
                         .enumerate()
                         .for_each(|(i, res_row)| {
-                            // Quantize Activation Row
                             let a_row_start = i * k;
                             let a_row = &a_data[a_row_start..a_row_start + k];
 
@@ -86,7 +87,6 @@ impl Backend for CpuBackend {
                             let mut a_scales = vec![0.0f32; num_blocks];
                             self.quantize_row_q8_0(a_row, &mut a_q8, &mut a_scales);
 
-                            // Process Columns in chunks
                             let chunk_size = 256;
                             for (cid, res_chunk) in res_row.chunks_mut(chunk_size).enumerate() {
                                 let start_col = cid * chunk_size;
@@ -98,8 +98,17 @@ impl Backend for CpuBackend {
                 }
             }
 
-            // [Case 2] F32 Weights (No Quantization)
-            Storage::Cpu(b_data) => {
+            // [Case 2] F32 Weights (Cpu OR Shared) - [수정됨]
+            // Shared 케이스도 여기서 함께 처리합니다.
+            s if matches!(s, Storage::Cpu(_) | Storage::Shared { .. }) => {
+                let b_data = match s {
+                    Storage::Cpu(d) => d.as_slice(),
+                    Storage::Shared { ptr, size, .. } => unsafe {
+                        std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+                    },
+                    _ => unreachable!(),
+                };
+
                 if m == 1 {
                     result_data.par_iter_mut().enumerate().for_each(|(j, res)| {
                         let a_row = &a_data[0..k];
@@ -131,30 +140,33 @@ impl Backend for CpuBackend {
         Tensor::new(result_data, Shape::new(vec![m, n]))
     }
 
-    // [기본 행렬 곱] A @ B
+    // [기본 행렬 곱] A @ B (수정됨)
     fn matmul(&self, a: &Tensor, b: &Tensor) -> Tensor {
         let dims_a = a.shape().dims();
         let dims_b = b.shape().dims();
-
         let (m, k) = (dims_a[0], dims_a[1]);
         let (k2, n) = (dims_b[0], dims_b[1]);
 
         if k != k2 {
-            panic!(
-                "MatMul Dimension mismatch: ({}, {}) @ ({}, {})",
-                m, k, k2, n
-            );
+            panic!("MatMul Dimension mismatch");
         }
 
         let mut result_data = vec![0.0; m * n];
 
+        // [수정] 데이터 접근 시 Shared 지원
         let a_data = match &*a.storage {
-            Storage::Cpu(d) => d,
-            _ => panic!("CpuBackend requires CPU storage for input A"),
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
+            _ => panic!("CpuBackend requires CPU/Shared storage for input A"),
         };
         let b_data = match &*b.storage {
-            Storage::Cpu(d) => d,
-            _ => panic!("CpuBackend requires CPU storage for input B"),
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
+            _ => panic!("CpuBackend requires CPU/Shared storage for input B"),
         };
 
         if m == 1 {
@@ -202,7 +214,10 @@ impl Backend for CpuBackend {
 
         let mut result_data = vec![0.0; m * rows];
         let a_data = match &*a.storage {
-            Storage::Cpu(d) => d,
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
             _ => panic!("CpuBackend requires CPU storage"),
         };
 
@@ -237,14 +252,17 @@ impl Backend for CpuBackend {
 
     fn add_assign(&self, a: &mut Tensor, b: &Tensor) {
         if a.shape() != b.shape() {
-            panic!("Shape mismatch in add_assign");
+            panic!("Shape mismatch");
         }
         let a_data = match Arc::get_mut(&mut a.storage) {
             Some(Storage::Cpu(d)) => d,
             _ => panic!("Cannot mutate shared/non-cpu storage"),
         };
         let b_data = match &*b.storage {
-            Storage::Cpu(d) => d,
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
             _ => panic!("CpuBackend requires CPU storage"),
         };
         a_data
@@ -262,7 +280,10 @@ impl Backend for CpuBackend {
             _ => panic!("Cannot mutate shared/non-cpu storage"),
         };
         let up_data = match &*up.storage {
-            Storage::Cpu(d) => d,
+            Storage::Cpu(d) => d.as_slice(), // as_slice() 추가
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
             _ => panic!("CpuBackend requires CPU storage"),
         };
         gate_data
@@ -311,11 +332,17 @@ impl Backend for CpuBackend {
         let last_dim = *dims.last().unwrap();
 
         let x_data = match &*x.storage {
-            Storage::Cpu(d) => d,
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
             _ => panic!("CpuBackend requires CPU storage"),
         };
         let w_data = match &*weight.storage {
-            Storage::Cpu(d) => d,
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
             _ => panic!("CpuBackend requires CPU storage"),
         };
 
@@ -352,7 +379,10 @@ impl Backend for CpuBackend {
         let last_dim = *dims.last().unwrap();
 
         let x_data = match &*x.storage {
-            Storage::Cpu(d) => d,
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
             _ => panic!("CpuBackend requires CPU storage"),
         };
 
@@ -380,7 +410,10 @@ impl Backend for CpuBackend {
 
     fn scale(&self, x: &Tensor, value: f32) -> Tensor {
         let x_data = match &*x.storage {
-            Storage::Cpu(d) => d,
+            Storage::Cpu(d) => d.as_slice(),
+            Storage::Shared { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, size / 4)
+            },
             _ => panic!("CpuBackend requires CPU storage"),
         };
         let new_data: Vec<f32> = x_data.par_iter().map(|&e| e * value).collect();
@@ -390,7 +423,11 @@ impl Backend for CpuBackend {
     fn copy_from(&self, tensor: &Tensor) -> Tensor {
         match &*tensor.storage {
             Storage::Cpu(data) => Tensor::new(data.clone(), tensor.shape().clone()),
-            _ => panic!("Copying from non-CPU storage not implemented yet"),
+            Storage::Shared { ptr, size, .. } => {
+                let slice = unsafe { std::slice::from_raw_parts(*ptr as *const f32, size / 4) };
+                Tensor::new(slice.to_vec(), tensor.shape().clone())
+            }
+            _ => panic!("Copying from non-CPU/Shared storage not implemented yet"),
         }
     }
 }
@@ -599,7 +636,7 @@ impl CpuBackend {
                 let w_16_31 = vzip2q_s8(w_low_s8, w_high_s8); // w16..w31
 
                 // Load Activations (32 bytes = 2 vectors)
-                let a_0 = vld1q_s8(q8_ptr);       // a0..a15
+                let a_0 = vld1q_s8(q8_ptr); // a0..a15
                 let a_1 = vld1q_s8(q8_ptr.add(16)); // a16..a31
 
                 // 4. SDOT

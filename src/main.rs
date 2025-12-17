@@ -14,6 +14,7 @@ use std::io::Write; // flush를 위해 필요
 use std::path::PathBuf;
 use tokenizers::Tokenizer; // [New] 랜덤 샘플링을 위해 필요
 
+use crate::backend::Device;
 use crate::core::config::LlamaConfig;
 use crate::core::loader::Loader;
 use crate::core::shape::Shape;
@@ -45,13 +46,17 @@ struct Args {
     #[arg(short = 'w', long, default_value_t = 64)]
     penalty_window: usize,
 
-    // [New] Temperature (창의성 조절: 높을수록 다양함, 낮을수록 보수적)
+    // Temperature (창의성 조절: 높을수록 다양함, 낮을수록 보수적)
     #[arg(long, default_value_t = 0.8)]
     temperature: f32,
 
-    // [New] Top-P (Nucleus Sampling: 상위 P% 확률 내에서만 뽑기)
+    // Top-P (Nucleus Sampling: 상위 P% 확률 내에서만 뽑기)
     #[arg(long, default_value_t = 0.9)]
     top_p: f32,
+
+    // 디바이스 선택 옵션 (cpu, gpu)
+    #[arg(long, default_value = "cpu")]
+    device: String,
 }
 
 fn main() -> Result<()> {
@@ -70,40 +75,152 @@ fn main() -> Result<()> {
     let config_file = std::fs::File::open(&args.config)?;
     let config: LlamaConfig = serde_json::from_reader(std::io::BufReader::new(config_file))?;
     let loader = Loader::new(&args.model)?;
-    let model = loader.load_model(&config)?;
+    let mut model = loader.load_model(&config)?;
+    let device = match args.device.to_lowercase().as_str() {
+        "gpu" | "opencl" => Device::OpenCl,
+        _ => Device::Cpu,
+    };
+
+    if device == Device::OpenCl {
+        // Phase 2에서 만든 OpenCL 초기화가 내부적으로 수행됨
+        model = model.to_device(Device::OpenCl);
+    }
+
     let tokenizer = Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!(e))?;
     profile!("0. Model Loading"); // 블록이 끝나면 자동 기록됨
 
-    println!("Testing OpenCL Shared Memory...");
-    let cl_backend = crate::backend::opencl::OpenClBackend::new();
-    let shape = Shape::new(vec![10]);
-
-    // 1. Shared Tensor 할당
-    let mut tensor = cl_backend.allocate_shared(&shape);
-    println!("Tensor created on: {:?}", tensor.device());
-
-    // 2. CPU에서 데이터 쓰기 (직접 포인터 접근)
     {
-        let data = tensor.data_mut();
-        for i in 0..10 {
-            data[i] = 10.0; // 초기값 10.0
+        println!("Testing OpenCL Shared Memory...");
+        let cl_backend = crate::backend::opencl::OpenClBackend::new();
+        let shape = Shape::new(vec![10]);
+
+        // 1. Shared Tensor 할당
+        let mut tensor = cl_backend.allocate_shared(&shape);
+        println!("Tensor created on: {:?}", tensor.device());
+
+        // 2. CPU에서 데이터 쓰기 (직접 포인터 접근)
+        {
+            let data = tensor.data_mut();
+            for i in 0..10 {
+                data[i] = 10.0; // 초기값 10.0
+            }
+            println!("CPU wrote 10.0 to all elements.");
         }
-        println!("CPU wrote 10.0 to all elements.");
-    }
 
-    // 3. GPU 커널 실행 (각 원소에 +1.0)
-    // 데이터 복사(WriteBuffer/ReadBuffer) 없이 커널만 실행합니다.
-    println!("Launching GPU kernel (add +1.0)...");
-    cl_backend.launch_dummy_kernel(&tensor);
+        // 3. GPU 커널 실행 (각 원소에 +1.0)
+        // 데이터 복사(WriteBuffer/ReadBuffer) 없이 커널만 실행합니다.
+        println!("Launching GPU kernel (add +1.0)...");
+        cl_backend.launch_dummy_kernel(&tensor);
 
-    // 4. CPU에서 데이터 확인
-    {
-        let data = tensor.data();
-        println!("Result check: {:?}", data);
-        if data[0] == 11.0 {
-            println!(">> SUCCESS: Zero-Copy Shared Memory works! (10.0 -> 11.0)");
+        // 4. CPU에서 데이터 확인
+        {
+            let data = tensor.data();
+            println!("Result check: {:?}", data);
+            if data[0] == 11.0 {
+                println!(">> SUCCESS: Zero-Copy Shared Memory works! (10.0 -> 11.0)");
+            } else {
+                println!(">> FAILURE: Value mismatch. Got {}", data[0]);
+            }
+        }
+
+        println!("Testing OpenCL MatMul (Phase 2)...");
+        let cl_backend = crate::backend::opencl::OpenClBackend::new();
+
+        // A: [2, 4]
+        let shape_a = Shape::new(vec![2, 4]);
+        let mut a = cl_backend.allocate_shared(&shape_a);
+        {
+            let d = a.data_mut();
+            // Row 1: 1, 1, 1, 1
+            // Row 2: 2, 2, 2, 2
+            for i in 0..4 {
+                d[i] = 1.0;
+            }
+            for i in 4..8 {
+                d[i] = 2.0;
+            }
+        }
+
+        // B: [4, 2] (Normal)
+        let shape_b = Shape::new(vec![4, 2]);
+        let mut b = cl_backend.allocate_shared(&shape_b);
+        {
+            let d = b.data_mut();
+            // Col 1: 1, 1, 1, 1
+            // Col 2: 2, 2, 2, 2 (interleaved)
+            // [1, 2, 1, 2, 1, 2, 1, 2]
+            for i in 0..8 {
+                d[i] = if i % 2 == 0 { 1.0 } else { 2.0 };
+            }
+        }
+
+        // Execute GPU MatMul
+        // A @ B -> [2, 2]
+        // [1,1,1,1] . [1,1,1,1] = 4
+        // [1,1,1,1] . [2,2,2,2] = 8
+        // [2,2,2,2] . [1,1,1,1] = 8
+        // [2,2,2,2] . [2,2,2,2] = 16
+        let c = a.matmul(&b);
+
+        println!("MatMul Result: {:?}", c.data());
+
+        let res = c.data();
+        if res[0] == 4.0 && res[1] == 8.0 && res[2] == 8.0 && res[3] == 16.0 {
+            println!(">> SUCCESS: GPU MatMul works correctly!");
         } else {
-            println!(">> FAILURE: Value mismatch. Got {}", data[0]);
+            println!(">> FAILURE: MatMul results incorrect.");
+        }
+
+        println!("Testing OpenCL Ops (Phase 3: RMSNorm & SiLU)...");
+
+        // 1. RMS Norm Test
+        // Input: [1.0, 2.0, 3.0, 4.0]
+        // Weight: [1.0, 1.0, 1.0, 1.0]
+        // Squares: 1+4+9+16 = 30. Mean = 7.5. RMS = sqrt(7.5) ≈ 2.7386
+        // Expected: [1/2.738, 2/2.738, ...] ≈ [0.365, 0.730, 1.095, 1.460]
+        let shape_vec = Shape::new(vec![4]);
+        let mut vec_x = cl_backend.allocate_shared(&shape_vec);
+        let mut vec_w = cl_backend.allocate_shared(&shape_vec);
+        {
+            let d = vec_x.data_mut();
+            d[0] = 1.0;
+            d[1] = 2.0;
+            d[2] = 3.0;
+            d[3] = 4.0;
+            let w = vec_w.data_mut();
+            for i in 0..4 {
+                w[i] = 1.0;
+            }
+        }
+
+        let norm_out = vec_x.rms_norm(&vec_w, 1e-5);
+        let res_norm = norm_out.data();
+        println!("RMSNorm Result: {:?}", res_norm);
+        if (res_norm[0] - 0.365).abs() < 0.01 {
+            println!(">> SUCCESS: RMSNorm working.");
+        } else {
+            println!(">> FAILURE: RMSNorm mismatch.");
+        }
+
+        // 2. SiLU Test
+        // Gate: [2.0], Up: [10.0]
+        // SiLU(2.0) = 2.0 / (1 + exp(-2)) ≈ 2.0 / (1 + 0.135) ≈ 2.0 / 1.135 ≈ 1.761
+        // Result = 1.761 * 10.0 = 17.61
+        let shape_sc = Shape::new(vec![1]);
+        let mut gate = cl_backend.allocate_shared(&shape_sc);
+        let mut up = cl_backend.allocate_shared(&shape_sc);
+        {
+            gate.data_mut()[0] = 2.0;
+            up.data_mut()[0] = 10.0;
+        }
+        gate.silu_mul_inplace(&up);
+        let res_silu = gate.data()[0];
+        println!("SiLU Result: {:.4}", res_silu);
+
+        if (res_silu - 17.615).abs() < 0.1 {
+            println!(">> SUCCESS: SiLU working.");
+        } else {
+            println!(">> FAILURE: SiLU mismatch.");
         }
     }
 
@@ -140,21 +257,41 @@ fn main() -> Result<()> {
             let input_tensor: Tensor;
             {
                 profile!("3. Input Preparation");
-                // Embedding
+                // Embedding Look-up은 CPU에서 수행하는 것이 효율적일 수 있으나,
+                // 모델 구조상 embed_tokens가 GPU에 가 있으면 Look-up을 위해
+                // 인덱스를 GPU로 보내거나, embed_tokens를 CPU에 남겨둬야 합니다.
+                // 현재 구조: embed_tokens도 GPU로 이동함.
+
+                // [간단한 해결책]
+                // Embeddings는 보통 CPU에서 룩업해서 GPU로 올리는게 일반적입니다.
+                // 하지만 여기서는 model.embed_tokens도 to_device로 GPU로 가버렸습니다.
+                // 따라서 GPU 텐서에서 슬라이싱을 해야 하는데, 현재 백엔드엔 Gather 커널이 없습니다.
+
+                // [수정 제안]
+                // Loader나 Model 구조상 Embeddings는 CPU에 남겨두거나,
+                // 여기서는 임시로 CPU에서 룩업 후 GPU로 올리는 방식을 씁니다.
+                // (주의: model.embed_tokens가 GPU면 data() 접근이 Shared Memory라 가능하긴 함)
+
                 let hidden = config.hidden_size;
                 let mut embed_data = Vec::with_capacity(chunk_len * hidden);
+
+                // Zero-Copy 덕분에 GPU에 있어도 data()로 읽기 가능!
                 let all_embeds = model.embed_tokens.data();
                 for &id in &input_chunk {
                     let start = (id as usize) * hidden;
                     embed_data.extend_from_slice(&all_embeds[start..start + hidden]);
                 }
-                input_tensor = Tensor::new(embed_data, Shape::new(vec![chunk_len, hidden]));
+
+                // [핵심] 입력 텐서를 타겟 디바이스로 생성/이동
+                input_tensor =
+                    Tensor::new(embed_data, Shape::new(vec![chunk_len, hidden])).to_device(device);
             }
 
             // Forward
             let logits: Tensor;
             {
                 profile!("4. Forward Pass");
+                // input_tensor가 device에 있으므로 내부 연산도 device에서 수행됨
                 logits = model.forward(&input_tensor, cur_pos);
             }
 

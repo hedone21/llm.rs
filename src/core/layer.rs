@@ -1,5 +1,5 @@
 use super::tensor::Tensor;
-use crate::{core::shape::Shape, profile};
+use crate::{backend::Device, core::shape::Shape, profile};
 use log::*;
 use rayon::prelude::*;
 use std::cell::RefCell;
@@ -13,6 +13,11 @@ impl Linear {
     }
     pub fn forward(&self, x: &Tensor) -> Tensor {
         x.matmul_transposed(&self.weight)
+    }
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            weight: self.weight.to_device(device),
+        }
     }
 }
 
@@ -86,9 +91,17 @@ impl LlamaMLP {
 
         // 3. Down Projection
         // 압축된 데이터를 바로 Tensor로 포장 (복사 없음)
-        let input = Tensor::new(result_data, Shape::new(vec![seq_len, mid]));
+        let input = Tensor::new(result_data, Shape::new(vec![seq_len, mid]))
+            .to_device(self.down_proj.weight.device());
 
         self.down_proj.forward(&input)
+    }
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            gate_up_proj: self.gate_up_proj.to_device(device),
+            down_proj: self.down_proj.to_device(device),
+            intermediate_size: self.intermediate_size,
+        }
     }
 }
 
@@ -112,6 +125,14 @@ impl KVCache {
             v: RefCell::new(Tensor::zeros(v_shape)),
             max_seq_len,
             head_dim,
+        }
+    }
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            k: RefCell::new(self.k.borrow().to_device(device)),
+            v: RefCell::new(self.v.borrow().to_device(device)),
+            max_seq_len: self.max_seq_len,
+            head_dim: self.head_dim,
         }
     }
 }
@@ -306,10 +327,20 @@ impl LlamaAttention {
             }
         });
 
-        self.o_proj.forward(&Tensor::new(
-            context_data,
-            Shape::new(vec![seq_len, hidden]),
-        ))
+        let context = Tensor::new(context_data, Shape::new(vec![seq_len, hidden]))
+            .to_device(self.o_proj.weight.device());
+
+        self.o_proj.forward(&context)
+    }
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            q_proj: self.q_proj.to_device(device),
+            k_proj: self.k_proj.to_device(device),
+            v_proj: self.v_proj.to_device(device),
+            o_proj: self.o_proj.to_device(device),
+            n_heads: self.n_heads,
+            cache: self.cache.to_device(device),
+        }
     }
 }
 
@@ -323,6 +354,12 @@ impl LlamaRMSNorm {
     }
     pub fn forward(&self, x: &Tensor) -> Tensor {
         x.rms_norm(&self.weight, self.eps)
+    }
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            weight: self.weight.to_device(device),
+            eps: self.eps,
+        }
     }
 }
 
@@ -367,6 +404,14 @@ impl LlamaBlock {
             mlp_out.add_assign(&h);
         }
         mlp_out
+    }
+    pub fn to_device(&self, device: Device) -> Self {
+        Self {
+            attn: self.attn.to_device(device),
+            mlp: self.mlp.to_device(device),
+            input_norm: self.input_norm.to_device(device),
+            post_norm: self.post_norm.to_device(device),
+        }
     }
 }
 // (Test 코드는 파일 끝에 이전과 같이 포함되어야 합니다)
