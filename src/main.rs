@@ -66,7 +66,6 @@ fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    // ... (로딩 로그 생략) ...
 
     let config_file = std::fs::File::open(&args.config)?;
     let config: LlamaConfig = serde_json::from_reader(std::io::BufReader::new(config_file))?;
@@ -74,6 +73,39 @@ fn main() -> Result<()> {
     let model = loader.load_model(&config)?;
     let tokenizer = Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!(e))?;
     profile!("0. Model Loading"); // 블록이 끝나면 자동 기록됨
+
+    println!("Testing OpenCL Shared Memory...");
+    let cl_backend = crate::backend::opencl::OpenClBackend::new();
+    let shape = Shape::new(vec![10]);
+
+    // 1. Shared Tensor 할당
+    let mut tensor = cl_backend.allocate_shared(&shape);
+    println!("Tensor created on: {:?}", tensor.device());
+
+    // 2. CPU에서 데이터 쓰기 (직접 포인터 접근)
+    {
+        let data = tensor.data_mut();
+        for i in 0..10 {
+            data[i] = 10.0; // 초기값 10.0
+        }
+        println!("CPU wrote 10.0 to all elements.");
+    }
+
+    // 3. GPU 커널 실행 (각 원소에 +1.0)
+    // 데이터 복사(WriteBuffer/ReadBuffer) 없이 커널만 실행합니다.
+    println!("Launching GPU kernel (add +1.0)...");
+    cl_backend.launch_dummy_kernel(&tensor);
+
+    // 4. CPU에서 데이터 확인
+    {
+        let data = tensor.data();
+        println!("Result check: {:?}", data);
+        if data[0] == 11.0 {
+            println!(">> SUCCESS: Zero-Copy Shared Memory works! (10.0 -> 11.0)");
+        } else {
+            println!(">> FAILURE: Value mismatch. Got {}", data[0]);
+        }
+    }
 
     let encoding = tokenizer
         .encode(args.prompt.clone(), true)

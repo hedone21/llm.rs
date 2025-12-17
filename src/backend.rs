@@ -1,6 +1,7 @@
 use crate::core::tensor::Tensor;
 
 pub mod cpu;
+pub mod opencl;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Device {

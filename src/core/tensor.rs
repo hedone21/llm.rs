@@ -4,25 +4,24 @@ use std::sync::Arc;
 use crate::backend::cpu::CpuBackend;
 use crate::backend::{Backend, Device};
 
+use ocl::{Buffer, Queue};
+
 #[derive(Debug)]
 pub enum Storage {
-    // 1. 일반 CPU 메모리 (Vec<f32>)
     Cpu(Vec<f32>),
     CpuQ4 {
         data: Vec<u8>,
         scales: Vec<f32>,
     },
-
-    // 2. 안드로이드 공유 메모리 (Zero-Copy)
-    // CPU는 ptr로 접근, GPU/NPU는 handle(fd)로 접근
+    // [수정] Shared Variant에 queue 필드 추가
     Shared {
         ptr: *mut u8,
-        handle: usize, // file descriptor or AHardwareBuffer pointer
+        handle: usize,
         size: usize,
+        cl_buffer: Option<Buffer<f32>>,
+        queue: Option<Queue>, // Unmap을 위해 큐 보관
     },
-
-    // 3. 디바이스 전용 메모리 (접근 불가, 포인터만 유지)
-    OpenClBuffer(usize),
+    OpenCl(Buffer<f32>),
     QnnTensor(usize),
 }
 
@@ -50,29 +49,6 @@ impl Tensor {
             shape,
             device: Device::Cpu,
             storage: Arc::new(Storage::Cpu(data)),
-        }
-    }
-
-    // [생성자] 공유 메모리 텐서 (안드로이드 최적화)
-    // 실제로는 AHardwareBuffer_allocate 등을 호출해야 함
-    pub fn new_shared(shape: Shape) -> Self {
-        let size_bytes = shape.num_elements() * 4;
-
-        // Mockup: 실제로는 mmap된 포인터를 사용해야 함
-        // 여기서는 벡터를 만들고 포인터만 취한 뒤 잊어버리는(forget) 흉내만 냅니다.
-        let mut vec = vec![0u8; size_bytes];
-        let ptr = vec.as_mut_ptr();
-        std::mem::forget(vec); // 메모리 해제 방지 (실제 구현에선 소멸자 처리 필요)
-
-        Self {
-            name: None,
-            shape,
-            device: Device::Cpu, // 기본적으로 CPU에서 접근 가능
-            storage: Arc::new(Storage::Shared {
-                ptr,
-                handle: 0, // Mock FD
-                size: size_bytes,
-            }),
         }
     }
 
@@ -137,60 +113,141 @@ impl Tensor {
         &self.shape
     }
 
-    // [데이터 접근] 읽기 전용 슬라이스
-    // 주의: CPU 접근 가능한 스토리지일 때만 동작
+    pub fn from_storage(storage: Storage, shape: Shape, device: Device) -> Self {
+        Self {
+            name: None,
+            shape,
+            device,
+            storage: Arc::new(storage),
+        }
+    }
+
+    pub fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     pub fn data(&self) -> &[f32] {
         match &*self.storage {
             Storage::Cpu(vec) => vec,
             Storage::Shared { ptr, size, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr as *const f32, size / 4)
             },
-            _ => panic!("Tensor data is not accessible on CPU directly"),
+            Storage::OpenCl(_) => {
+                panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
+            }
+            _ => panic!("Tensor data is not accessible directly"),
         }
     }
 
-    // [데이터 접근] 쓰기 전용 슬라이스
-    // 주의: Reference Count가 1일 때만 수정 가능 (CoW는 여기선 생략)
     pub fn data_mut(&mut self) -> &mut [f32] {
-        // Arc의 유일한 소유자인지 확인하고, 아니면 복사(Clone)해야 하지만
-        // 성능을 위해 여기서는 Unsafe하게 포인터를 따거나,
-        // Storage가 Cpu일 때 get_mut을 시도합니다.
-
-        // Shared Memory의 경우 항상 접근 허용
-        if let Storage::Shared { ptr, size, .. } = *self.storage {
-            return unsafe { std::slice::from_raw_parts_mut(ptr as *mut f32, size / 4) };
-        }
-
-        // CPU Memory의 경우
         match Arc::get_mut(&mut self.storage) {
-            Some(Storage::Cpu(vec)) => vec,
-            _ => panic!("Cannot mutate shared or non-cpu storage"),
+            Some(storage) => match storage {
+                Storage::Cpu(vec) => vec,
+                Storage::Shared { ptr, size, .. } => unsafe {
+                    std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
+                },
+                Storage::OpenCl(_) => {
+                    panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
+                }
+                _ => panic!("Tensor data is not writable directly"),
+            },
+            None => {
+                panic!("Cannot get mutable reference to Tensor data; multiple references exist")
+            }
         }
     }
 
-    // [Offloading] 디바이스 이동
     pub fn to_device(&self, target: Device) -> Self {
         if self.device == target {
             return self.clone();
         }
 
         match (&*self.storage, target) {
-            // Shared Memory는 장치만 바꾸면 됨 (Zero-Copy)
+            // 1. Shared -> Any (Zero-Copy)
+            // 이미 Shared라면 디바이스 태그만 변경 (CPU <-> GPU 전환 비용 0)
             (Storage::Shared { .. }, _) => {
                 let mut new_tensor = self.clone();
                 new_tensor.device = target;
                 new_tensor
             }
-            // CPU -> GPU/NPU (복사 필요)
-            (Storage::Cpu(_), _) => {
-                // TODO: 실제 백엔드 버퍼 할당 및 업로드 로직
-                // 현재는 Mockup으로 CPU 유지
-                let mut new_t = self.clone();
-                new_t.device = target;
-                new_t
+
+            // 2. Cpu -> OpenCl (Upload)
+            (Storage::Cpu(_), Device::OpenCl) => {
+                {
+                    use crate::backend::opencl::OpenClBackend;
+                    let backend = OpenClBackend::new();
+                    let new_tensor = backend.allocate_shared(&self.shape);
+
+                    // CPU -> Shared Mem Copy
+                    let src = self.data();
+                    let dst = unsafe {
+                        match &*new_tensor.storage {
+                            Storage::Shared { ptr, size, .. } => {
+                                std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
+                            }
+                            _ => unreachable!(),
+                        }
+                    };
+                    dst.copy_from_slice(src);
+                    new_tensor
+                }
             }
+
+            // 3. CpuQ4 -> OpenCl (Dequantize & Upload)
+            // [중요] GPU는 현재 F32 커널만 지원하므로, 여기서 압축을 풉니다.
+            (Storage::CpuQ4 { data, scales }, Device::OpenCl) => {
+                {
+                    use crate::backend::opencl::OpenClBackend;
+                    let backend = OpenClBackend::new();
+                    let new_tensor = backend.allocate_shared(&self.shape);
+
+                    let dst = unsafe {
+                        match &*new_tensor.storage {
+                            Storage::Shared { ptr, size, .. } => {
+                                std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
+                            }
+                            _ => unreachable!(),
+                        }
+                    };
+
+                    // Dequantize Loop (8.0 Offset Fix)
+                    let block_size = 32;
+                    let mut d_idx = 0;
+                    for (i, &scale) in scales.iter().enumerate() {
+                        let chunk_start = i * (block_size / 2);
+                        let chunk_end = (chunk_start + (block_size / 2)).min(data.len());
+
+                        for &packed in &data[chunk_start..chunk_end] {
+                            let low = (packed & 0x0F) as f32;
+                            let high = (packed >> 4) as f32;
+
+                            // [Fix] 8.5 -> 8.0 (Correct Offset)
+                            if d_idx < dst.len() {
+                                dst[d_idx] = (low - 8.0) * scale;
+                                d_idx += 1;
+                            }
+                            if d_idx < dst.len() {
+                                dst[d_idx] = (high - 8.0) * scale;
+                                d_idx += 1;
+                            }
+                        }
+                    }
+                    new_tensor
+                }
+            }
+
+            // 4. Fallback (OpenCl -> Cpu Copy)
+            (_, Device::Cpu) => {
+                let data = self.data().to_vec();
+                Tensor::new(data, self.shape.clone())
+            }
+
             _ => unimplemented!("Transfer not implemented"),
         }
+    }
+
+    pub fn device(&self) -> Device {
+        self.device
     }
 
     // -------------------------------------------------------------------------
