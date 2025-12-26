@@ -1,10 +1,12 @@
 use crate::backend::{Backend, Device};
 use crate::core::shape::Shape;
 use crate::core::tensor::{Storage, Tensor};
+use log::*;
 use ocl::{Buffer, ProQue, flags};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 static CL_CONTEXT: OnceLock<ProQue> = OnceLock::new();
+static SCRATCH_POOL: OnceLock<Mutex<ScratchPool>> = OnceLock::new();
 
 pub fn cl_context() -> &'static ProQue {
     CL_CONTEXT.get_or_init(|| {
@@ -28,6 +30,64 @@ pub fn cl_context() -> &'static ProQue {
             .build()
             .expect("Failed to build OpenCL program. Check kernel syntax.")
     })
+}
+
+// Scratch Pool Structure
+struct ScratchPool {
+    buffer: Buffer<f32>, // 거대한 단일 버퍼
+    ptr: *mut f32,       // 매핑된 호스트 포인터
+    capacity: usize,     // 총 엘리먼트 개수 (f32 기준)
+    offset: usize,       // 현재 사용 중인 오프셋
+}
+
+unsafe impl Send for ScratchPool {}
+
+// 스크래치 풀 초기화 함수 (Pre-init 단계에서 호출)
+pub fn init_scratch_pool(size_mb: usize) {
+    let context = cl_context();
+    // f32는 4바이트이므로 mb * 1024*1024 / 4
+    let num_elements = (size_mb * 1024 * 1024) / 4;
+
+    println!(
+        "[ScratchPool] Allocating shared memory: {} MB ({} elements)",
+        size_mb, num_elements
+    );
+
+    // 1. 거대한 버퍼 할당 (Zero-Copy)
+    let buffer = Buffer::<f32>::builder()
+        .queue(context.queue().clone())
+        .flags(flags::MEM_READ_WRITE | flags::MEM_ALLOC_HOST_PTR)
+        .len(num_elements)
+        .build()
+        .expect("Failed to allocate scratch pool");
+
+    // 2. 미리 매핑(Mapping)하여 포인터 획득
+    // 주의: Unmap을 하지 않고 유지합니다 (Persistent Mapping)
+    let ptr = unsafe {
+        buffer
+            .map()
+            .flags(flags::MAP_WRITE | flags::MAP_READ)
+            .enq()
+            .expect("Failed to map scratch buffer")
+            .as_mut_ptr()
+    };
+
+    SCRATCH_POOL
+        .set(Mutex::new(ScratchPool {
+            buffer,
+            ptr,
+            capacity: num_elements,
+            offset: 0,
+        }))
+        .ok();
+}
+
+// 스크래치 풀 리셋 (매 Step 종료 시 호출)
+pub fn reset_scratch_pool() {
+    if let Some(pool_lock) = SCRATCH_POOL.get() {
+        let mut pool = pool_lock.lock().unwrap();
+        pool.offset = 0;
+    }
 }
 
 pub struct OpenClBackend {
@@ -63,6 +123,43 @@ impl OpenClBackend {
     // --- Allocators (Existing behavior maintained) ---
     pub fn allocate_shared(&self, shape: &Shape) -> Tensor {
         let count = shape.num_elements();
+
+        if let Some(pool_lock) = SCRATCH_POOL.get() {
+            let mut pool = pool_lock.lock().unwrap();
+
+            // 용량 체크
+            if pool.offset + count <= pool.capacity {
+                let current_offset = pool.offset;
+                pool.offset += count;
+
+                // 1. 호스트 포인터 계산 (단순 산술 연산, 비용 0)
+                let ptr = unsafe { pool.ptr.add(current_offset) };
+
+                // 2. OpenCL Sub-Buffer 생성
+                // (실제 할당이 아니라 뷰만 생성하므로 매우 빠름)
+                let sub_buffer = pool
+                    .buffer
+                    .create_sub_buffer(Some(flags::MEM_READ_WRITE), current_offset, count)
+                    .unwrap();
+
+                return Tensor::from_storage(
+                    Storage::Shared {
+                        ptr: ptr as *mut u8,
+                        size: count * 4,
+                        cl_buffer: Some(sub_buffer),
+                        queue: Some(self.context.queue().clone()),
+                    },
+                    shape.clone(),
+                    Device::OpenCl,
+                );
+            } else {
+                // 풀이 가득 차면 경고 후 일반 할당으로 넘어감 (혹은 패닉)
+                // eprintln!("[Warn] Scratch pool exhausted! Falling back to slow allocation.");
+                error!("Scratch pool exhausted! Falling back to slow allocation.");
+            }
+        }
+
+        // [Fallback] 풀이 없거나 가득 찬 경우 (기존 방식: 느림)
         let buffer = Buffer::<f32>::builder()
             .queue(self.context.queue().clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_ALLOC_HOST_PTR)
@@ -70,7 +167,6 @@ impl OpenClBackend {
             .build()
             .unwrap();
 
-        // Lazy mapping recommended, but maintaining existing behavior as requested:
         let ptr = unsafe { buffer.map().enq().unwrap().as_mut_ptr() };
 
         Tensor::from_storage(

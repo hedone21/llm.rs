@@ -21,6 +21,9 @@ use crate::core::shape::Shape;
 use crate::core::tensor::Tensor;
 use crate::profile::Profiler;
 
+#[cfg(feature = "opencl")]
+use crate::backend::opencl::*;
+
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
@@ -85,9 +88,12 @@ fn main() -> Result<()> {
         _ => Device::Cpu,
     };
 
+    #[cfg(feature = "opencl")]
     if device == Device::OpenCl {
         // Phase 2에서 만든 OpenCL 초기화가 내부적으로 수행됨
         model = model.to_device(Device::OpenCl);
+
+        init_scratch_pool(512);
     }
 
     debug!("Init tokenizer");
@@ -342,6 +348,13 @@ fn main() -> Result<()> {
                         *logit /= temp;
                     }
                 }
+            }
+
+            // 텐서 사용이 끝났으므로 스크래치 풀을 리셋합니다.
+            // 다음 스텝의 matmul은 다시 offset 0부터 메모리를 덮어씁니다.
+            #[cfg(feature = "opencl")]
+            if device == Device::OpenCl {
+                reset_scratch_pool();
             }
 
             // 3. Softmax (확률 변환)
