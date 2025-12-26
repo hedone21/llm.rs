@@ -94,7 +94,7 @@ fn main() -> Result<()> {
     let tokenizer = Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!(e))?;
     profile!("0. Model Loading"); // 블록이 끝나면 자동 기록됨
 
-    #[cfg(feature="opencl")]
+    #[cfg(feature = "opencl")]
     {
         println!("Testing OpenCL Shared Memory...");
         let cl_backend = crate::backend::opencl::OpenClBackend::new();
