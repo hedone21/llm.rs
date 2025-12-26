@@ -233,7 +233,6 @@ impl OpenClBackend {
                 size: count * 4,
                 cl_buffer: Some(buffer),
                 queue: Some(self.context.queue().clone()),
-                handle: 0,
             },
             shape.clone(),
             Device::OpenCl,
@@ -244,7 +243,6 @@ impl OpenClBackend {
             Storage::Shared {
                 cl_buffer: Some(b), ..
             } => b,
-            Storage::OpenCl(b) => b,
             _ => panic!("Not F32"),
         }
     }
@@ -265,8 +263,7 @@ impl OpenClBackend {
 
         match (&*a.storage, &*b.storage) {
             // F32 x F32
-            (Storage::Shared { .. }, Storage::Shared { .. })
-            | (Storage::OpenCl(_), Storage::OpenCl(_)) => {
+            (Storage::Shared { .. }, Storage::Shared { .. }) => {
                 let name = "matmul_tiled_f32";
                 let buf_a = self.get_buffer(a);
                 let buf_b = self.get_buffer(b);

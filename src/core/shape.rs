@@ -12,10 +12,6 @@ impl Shape {
         &self.dims
     }
 
-    pub fn rank(&self) -> usize {
-        self.dims.len()
-    }
-
     pub fn num_elements(&self) -> usize {
         if self.dims.is_empty() {
             0

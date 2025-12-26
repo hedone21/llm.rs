@@ -1,11 +1,9 @@
 use log::*;
 
 use crate::backend::Device;
-use crate::core::layer::KVCache;
 use crate::profile;
 
-use super::layer::{Linear, LlamaAttention, LlamaBlock, LlamaMLP, LlamaRMSNorm};
-use super::shape::Shape;
+use super::layer::{Linear, LlamaBlock, LlamaRMSNorm};
 use super::tensor::Tensor;
 
 pub struct LlamaModel {
@@ -16,20 +14,6 @@ pub struct LlamaModel {
 }
 
 impl LlamaModel {
-    pub fn new(
-        embed_tokens: Tensor,
-        layers: Vec<LlamaBlock>,
-        norm: LlamaRMSNorm,
-        lm_head: Linear,
-    ) -> Self {
-        Self {
-            embed_tokens,
-            layers,
-            norm,
-            lm_head,
-        }
-    }
-
     pub fn forward(&self, x: &Tensor, start_pos: usize) -> Tensor {
         let mut h: Tensor;
         {

@@ -676,7 +676,7 @@ impl CpuBackend {
         b_s: &[f32],
         a_q8: &[i8],
         a_scales: &[f32],
-    ) {
+    ) { unsafe {
         let ones = _mm256_set1_epi16(1);
         let ones_u8 = _mm256_set1_epi8(1);
 
@@ -732,5 +732,5 @@ impl CpuBackend {
             }
             *res = total_sum;
         }
-    }
+    }}
 }

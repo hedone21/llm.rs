@@ -1,6 +1,5 @@
 use super::tensor::Tensor;
 use crate::{backend::Device, core::shape::Shape, profile};
-use log::*;
 use rayon::prelude::*;
 use std::cell::RefCell;
 

@@ -13,6 +13,7 @@ pub enum Device {
 
 // 모든 백엔드가 구현해야 할 연산 목록
 pub trait Backend {
+    // Debug 정보
     fn device(&self) -> Device;
     fn name(&self) -> &str;
 

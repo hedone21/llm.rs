@@ -1,6 +1,5 @@
 use anyhow::{Context, Result};
 use half::bf16;
-use log::*;
 use memmap2::MmapOptions;
 use safetensors::SafeTensors;
 use std::fs::File;

@@ -18,13 +18,14 @@ pub enum Storage {
     },
     Shared {
         ptr: *mut u8,
-        handle: usize,
         size: usize,
         #[cfg(feature = "opencl")]
         cl_buffer: Option<Buffer<f32>>,
+        #[allow(dead_code)]
         #[cfg(feature = "opencl")]
         queue: Option<Queue>, // Unmap을 위해 큐 보관
     },
+    #[allow(dead_code)]
     SharedQ4 {
         // 단일 버퍼에 [Data | Scales] 순서로 패킹하여 저장
         ptr: *mut u8,
@@ -38,9 +39,6 @@ pub enum Storage {
         data_len: usize,  // Q4 데이터 바이트 길이
         scale_len: usize, // Scale 데이터 바이트 길이 (실제 크기는 * 4)
     },
-    #[cfg(feature = "opencl")]
-    OpenCl(Buffer<f32>),
-    QnnTensor(usize),
 }
 
 // 포인터를 포함하므로 Thread Safety를 위해 마킹 (실제 구현 시 주의 필요)
@@ -140,10 +138,6 @@ impl Tensor {
         }
     }
 
-    pub fn storage(&self) -> &Storage {
-        &self.storage
-    }
-
     pub fn data(&self) -> &[f32] {
         match &*self.storage {
             Storage::Cpu(vec) => vec,
@@ -152,10 +146,6 @@ impl Tensor {
             },
             Storage::SharedQ4 { .. } => {
                 panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
-            }
-            #[cfg(feature = "opencl")]
-            Storage::OpenCl(_) => {
-                panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
             }
             _ => panic!("Tensor data is not accessible directly"),
         }
@@ -170,10 +160,6 @@ impl Tensor {
                 },
                 Storage::SharedQ4 { .. } => {
                     panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
-                }
-                #[cfg(feature = "opencl")]
-                Storage::OpenCl(_) => {
-                    panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
                 }
                 _ => panic!("Tensor data is not writable directly"),
             },
@@ -316,6 +302,7 @@ impl Tensor {
     }
 
     // Helper for non-assign version
+    #[allow(dead_code)]
     pub fn add(&self, other: &Tensor) -> Tensor {
         let mut res = self.clone();
         res.add_assign(other);
@@ -345,29 +332,5 @@ impl Tensor {
     // RoPE In-Place
     pub fn apply_rope_inplace(&mut self, start_pos: usize) {
         self.backend().rope_inplace(self, start_pos);
-    }
-
-    // Transpose
-    // (Loader 최적화로 인해 사용 빈도는 줄었으나, fallback용으로 유지)
-    pub fn transpose(&self) -> Tensor {
-        // Transpose는 구조적 변경이므로 보통 Copy가 일어남
-        // CPU 백엔드 구현을 사용하거나 각 백엔드별 구현 호출
-        // 여기서는 CpuBackend의 구현이 있다고 가정하고 호출하거나 직접 구현
-        // 편의상 CpuBackend 로직을 복사해 둠 (Backend trait에 transpose가 없다면)
-        // 하지만 Backend trait에 copy_from 등이 있으므로,
-        // 여기서는 간단히 CPU 로직으로 처리 (대부분 로딩 타임에만 쓰임)
-
-        let dims = self.shape.dims();
-        let (m, n) = (dims[0], dims[1]);
-        let mut new_data = vec![0.0; m * n];
-        let data = self.data(); // CPU access needed
-
-        // Naive transpose (loading time only)
-        for i in 0..m {
-            for j in 0..n {
-                new_data[j * m + i] = data[i * n + j];
-            }
-        }
-        Tensor::new(new_data, Shape::new(vec![n, m]))
     }
 }

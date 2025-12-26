@@ -6,8 +6,8 @@ mod profile;
 
 use anyhow::Result;
 use clap::Parser;
+use log::info;
 use log::*;
-use log::{error, info};
 use rand::Rng;
 use std::collections::HashSet;
 use std::io::Write; // flush를 위해 필요
@@ -242,7 +242,7 @@ fn main() -> Result<()> {
     let start_gen = std::time::Instant::now();
     let eos_token_ids = [128001u32, 128009u32]; // Llama 3 EOS
     let mut cur_pos = 0;
-    let mut rng = rand::thread_rng(); // 랜덤 생성기
+    let mut rng = rand::rng(); // 랜덤 생성기
 
     {
         profile!("1. Total Inference");
