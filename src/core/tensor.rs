@@ -2,9 +2,11 @@ use super::shape::Shape;
 use std::sync::Arc;
 // backend 모듈과 backend_impl 모듈이 core에 있다고 가정합니다.
 use crate::backend::cpu::CpuBackend;
+#[cfg(feature="opencl")]
 use crate::backend::opencl::OpenClBackend;
 use crate::backend::{Backend, Device};
 
+#[cfg(feature="opencl")]
 use ocl::{Buffer, Queue};
 
 #[derive(Debug)]
@@ -18,20 +20,25 @@ pub enum Storage {
         ptr: *mut u8,
         handle: usize,
         size: usize,
+        #[cfg(feature="opencl")]
         cl_buffer: Option<Buffer<f32>>,
+        #[cfg(feature="opencl")]
         queue: Option<Queue>, // Unmap을 위해 큐 보관
     },
     SharedQ4 {
         // 단일 버퍼에 [Data | Scales] 순서로 패킹하여 저장
         ptr: *mut u8,
         size: usize,
+        #[cfg(feature="opencl")]
         cl_buffer: Option<Buffer<u8>>, // Raw Bytes 컨테이너
+        #[cfg(feature="opencl")]
         queue: Option<Queue>,
 
         // 메타데이터
         data_len: usize,  // Q4 데이터 바이트 길이
         scale_len: usize, // Scale 데이터 바이트 길이 (실제 크기는 * 4)
     },
+    #[cfg(feature="opencl")]
     OpenCl(Buffer<f32>),
     QnnTensor(usize),
 }
@@ -146,6 +153,7 @@ impl Tensor {
             Storage::SharedQ4 { .. } => {
                 panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
             }
+            #[cfg(feature="opencl")]
             Storage::OpenCl(_) => {
                 panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
             }
@@ -163,6 +171,7 @@ impl Tensor {
                 Storage::SharedQ4 { .. } => {
                     panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
                 }
+                #[cfg(feature="opencl")]
                 Storage::OpenCl(_) => {
                     panic!("Cannot access Device-Local OpenCL tensor. Use .to_device(Cpu)")
                 }
@@ -189,6 +198,7 @@ impl Tensor {
             }
 
             // 2. Cpu -> OpenCl (Upload)
+            #[cfg(feature="opencl")]
             (Storage::Cpu(_), Device::OpenCl) => {
                 {
                     use crate::backend::opencl::OpenClBackend;
@@ -211,6 +221,7 @@ impl Tensor {
             }
 
             // 3. CpuQ4 -> OpenCl (Dequantize & Upload)
+            #[cfg(feature="opencl")]
             (Storage::CpuQ4 { data, scales }, Device::OpenCl) => {
                 use crate::backend::opencl::OpenClBackend;
                 let backend = OpenClBackend::new();
@@ -258,6 +269,7 @@ impl Tensor {
     fn backend(&self) -> Box<dyn Backend> {
         match self.device {
             Device::Cpu => Box::new(CpuBackend),
+            #[cfg(feature="opencl")]
             Device::OpenCl => Box::new(OpenClBackend::new()),
             _ => unimplemented!("Backend for device not implemented"),
         }

@@ -74,7 +74,11 @@ fn main() -> Result<()> {
 
     let config_file = std::fs::File::open(&args.config)?;
     let config: LlamaConfig = serde_json::from_reader(std::io::BufReader::new(config_file))?;
+
+    debug!("Init loader");
     let loader = Loader::new(&args.model)?;
+
+    debug!("Load model");
     let mut model = loader.load_model(&config)?;
     let device = match args.device.to_lowercase().as_str() {
         "gpu" | "opencl" => Device::OpenCl,
@@ -86,9 +90,11 @@ fn main() -> Result<()> {
         model = model.to_device(Device::OpenCl);
     }
 
+    debug!("Init tokenizer");
     let tokenizer = Tokenizer::from_file(&args.tokenizer).map_err(|e| anyhow::anyhow!(e))?;
     profile!("0. Model Loading"); // 블록이 끝나면 자동 기록됨
 
+    #[cfg(feature="opencl")]
     {
         println!("Testing OpenCL Shared Memory...");
         let cl_backend = crate::backend::opencl::OpenClBackend::new();

@@ -31,11 +31,12 @@ log = "0.4"
 env_logger = "0.10"
 
 # OpenCl
-ocl = "0.19"
+ocl = { version = "0.19", optional = true }
 
 [features]
 default = [] 
 profile = []
+opencl = ["ocl"]
 
 [profile.release]
 opt-level = 3       # 최고 수준 최적화
