@@ -246,6 +246,9 @@ fn main() -> Result<()> {
     std::io::stdout().flush()?;
 
     let start_gen = std::time::Instant::now();
+    let ttft_start = std::time::Instant::now();
+    let mut ttft_elapsed = std::time::Duration::ZERO;
+    let mut token_count = 0;
     let eos_token_ids = [128001u32, 128009u32]; // Llama 3 EOS
     let mut cur_pos = 0;
     let mut rng = rand::rng(); // 랜덤 생성기
@@ -444,6 +447,11 @@ fn main() -> Result<()> {
                     .decode(&[next_token as u32], true)
                     .unwrap_or_else(|_| "".to_string());
 
+                if token_count == 0 {
+                    ttft_elapsed = ttft_start.elapsed();
+                }
+                token_count += 1;
+
                 print!("{}", word);
                 std::io::stdout().flush()?;
             }
@@ -454,9 +462,11 @@ fn main() -> Result<()> {
 
     let elapsed = start_gen.elapsed();
     println!("\n--------------");
+    info!("Total Time: {:.2?}", elapsed);
+    info!("TTFT Time: {:.2?}ms", ttft_elapsed.as_millis());
     info!(
-        "Finished: {:.2} tok/s",
-        args.steps as f64 / elapsed.as_secs_f64()
+        "TBT Time: {:.2?}ms",
+        (elapsed - ttft_elapsed).as_millis() / token_count as u128
     );
 
     Ok(())
