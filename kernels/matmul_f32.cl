@@ -14,7 +14,7 @@ __kernel void kernel_matmul_f32(
     if (r < M && c < N) {
         float sum = 0.0f;
         for (int k=0; k<K; k++) {
-            sum += A[r*K + k] * B[c*K + k];
+            sum += A[r*K + k] * B[k*N + c];
         }
         C[r*N + c] = sum;
     }

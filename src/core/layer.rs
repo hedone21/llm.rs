@@ -79,12 +79,12 @@ impl LlamaMLP {
                     dst[i] = silu * u;
 
                     // [핵심] 값이 너무 작으면 0으로 죽임 (Sparsity 유도)
-                    let val = silu * u;
-                    if val.abs() < threshold {
-                        dst[i] = 0.0;
-                    } else {
-                        dst[i] = val;
-                    }
+                    // let val = silu * u;
+                    // if val.abs() < threshold {
+                    //     dst[i] = 0.0;
+                    // } else {
+                    //     dst[i] = val;
+                    // }
                 }
             });
 

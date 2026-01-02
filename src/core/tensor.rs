@@ -20,7 +20,7 @@ pub enum Storage {
         ptr: *mut u8,
         size: usize,
         #[cfg(feature = "opencl")]
-        cl_buffer: Option<Buffer<f32>>,
+        cl_buffer: Option<Buffer<f32>>, // Raw Bytes 컨테이너
         #[allow(dead_code)]
         #[cfg(feature = "opencl")]
         queue: Option<Queue>, // Unmap을 위해 큐 보관
@@ -31,7 +31,9 @@ pub enum Storage {
         ptr: *mut u8,
         size: usize,
         #[cfg(feature = "opencl")]
-        cl_buffer: Option<Buffer<u8>>, // Raw Bytes 컨테이너
+        cl_buffer: Option<Buffer<f32>>, // Raw Bytes 컨테이너
+        #[cfg(feature = "opencl")]
+        cl_scales: Option<Buffer<f32>>, // Scale 부분의 버퍼 (별도 핸들)
         #[cfg(feature = "opencl")]
         queue: Option<Queue>,
 
@@ -57,21 +59,44 @@ pub struct Tensor {
 impl Tensor {
     // [생성자] 일반 CPU 텐서
     pub fn new(data: Vec<f32>, shape: Shape) -> Self {
-        if data.len() != shape.num_elements() {
-            panic!("Data size mismatch");
+        #[cfg(feature = "opencl")]
+        {
+            // OpenCL 백엔드를 통해 Shared Memory 할당
+            let backend = crate::backend::opencl::OpenClBackend::new();
+            let mut tensor = backend.allocate_shared(&shape);
+            tensor.device = Device::Cpu; // 초기 장치는 CPU로 설정
+            tensor.data_mut().copy_from_slice(&data); // 데이터 복사
+            tensor
         }
-        Self {
-            name: None,
-            shape,
-            device: Device::Cpu,
-            storage: Arc::new(Storage::Cpu(data)),
+        #[cfg(not(feature = "opencl"))]
+        {
+            if data.len() != shape.num_elements() {
+                panic!("Data size mismatch");
+            }
+            Self {
+                name: None,
+                shape,
+                device: Device::Cpu,
+                storage: Arc::new(Storage::Cpu(data)),
+            }
         }
     }
 
     // [Helper] 0으로 초기화된 텐서
     pub fn zeros(shape: Shape) -> Self {
-        let count = shape.num_elements();
-        Self::new(vec![0.0; count], shape)
+        #[cfg(feature = "opencl")]
+        {
+            let backend = crate::backend::opencl::OpenClBackend::new();
+            let mut tensor = backend.allocate_shared(&shape);
+            tensor.device = Device::Cpu;
+            tensor.data_mut().fill(0.0);
+            tensor
+        }
+        #[cfg(not(feature = "opencl"))]
+        {
+            let count = shape.num_elements();
+            Self::new(vec![0.0; count], shape)
+        }
     }
 
     pub fn quantize_q4(&self) -> Tensor {
@@ -109,14 +134,35 @@ impl Tensor {
             }
         }
 
-        Tensor {
-            name: self.name.clone(),
-            shape: self.shape.clone(),
-            device: self.device,
-            storage: Arc::new(Storage::CpuQ4 {
-                data: q_data,
-                scales,
-            }),
+        #[cfg(feature = "opencl")]
+        {
+            let backend = crate::backend::opencl::OpenClBackend::new();
+            // SharedQ4 저장소 할당
+            let new_tensor = backend.allocate_shared_q4(&self.shape, q_data.len(), scales.len());
+
+            match &*new_tensor.storage {
+                Storage::SharedQ4 { ptr, data_len, .. } => unsafe {
+                    let base_ptr = *ptr;
+                    // Q4 데이터 및 스케일 복사
+                    std::ptr::copy_nonoverlapping(q_data.as_ptr(), base_ptr, q_data.len());
+                    let scale_ptr = base_ptr.add(*data_len) as *mut f32;
+                    std::ptr::copy_nonoverlapping(scales.as_ptr(), scale_ptr, scales.len());
+                },
+                _ => unreachable!(),
+            }
+            new_tensor
+        }
+        #[cfg(not(feature = "opencl"))]
+        {
+            Tensor {
+                name: self.name.clone(),
+                shape: self.shape.clone(),
+                device: self.device,
+                storage: Arc::new(Storage::CpuQ4 {
+                    data: q_data,
+                    scales,
+                }),
+            }
         }
     }
 
@@ -144,9 +190,9 @@ impl Tensor {
             Storage::Shared { ptr, size, .. } => unsafe {
                 std::slice::from_raw_parts(*ptr as *const f32, size / 4)
             },
-            Storage::SharedQ4 { .. } => {
-                panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
-            }
+            Storage::SharedQ4 { ptr, size, .. } => unsafe {
+                std::slice::from_raw_parts(*ptr as *const f32, *size / 4)
+            },
             _ => panic!("Tensor data is not accessible directly"),
         }
     }
@@ -158,9 +204,9 @@ impl Tensor {
                 Storage::Shared { ptr, size, .. } => unsafe {
                     std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
                 },
-                Storage::SharedQ4 { .. } => {
-                    panic!("Cannot access Q4 compressed data as F32 slice. Use backend kernels.")
-                }
+                Storage::SharedQ4 { ptr, size, .. } => unsafe {
+                    std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
+                },
                 _ => panic!("Tensor data is not writable directly"),
             },
             None => {

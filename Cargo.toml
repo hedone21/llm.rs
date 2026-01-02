@@ -3,6 +3,14 @@ name = "llmrs"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "llmrs"
+path = "src/main.rs"
+
+[[bin]]
+name = "llmrs-test"
+path = "src/bin/llmrs_test.rs"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -10,11 +18,14 @@ serde_json = "1.0"
 # 모델 로딩
 safetensors = "0.7"
 memmap2 = "0.9"
-half = "2.7.1"       # bf16 -> f32 변환용
+half = "2.7.1"      # bf16 -> f32 변환용
 
 # 토크나이저
 # tokenizers = "0.22"
-tokenizers = { version = "0.22", default-features = false, features = ["progressbar", "onig"] }
+tokenizers = { version = "0.22", default-features = false, features = [
+  "progressbar",
+  "onig",
+] }
 
 # 유틸리티
 anyhow = "1.0"
@@ -34,12 +45,12 @@ env_logger = "0.10"
 ocl = { version = "0.19", optional = true }
 
 [features]
-default = [] 
+default = ["opencl"]
 profile = []
 opencl = ["ocl"]
 
 [profile.release]
-opt-level = 3       # 최고 수준 최적화
-lto = "fat"         # 모든 크레이트를 통합해서 최적화 (시간 오래 걸리지만 가장 빠름)
-codegen-units = 1   # 병렬 코드 생성 끄기 (하나의 단위로 분석하여 최적화 효율 증대)
-panic = "abort"     # 패닉 발생 시 스택 풀기 생략 (코드 크기 감소 및 속도 향상)
+opt-level = 3     # 최고 수준 최적화
+lto = "fat"       # 모든 크레이트를 통합해서 최적화 (시간 오래 걸리지만 가장 빠름)
+codegen-units = 1 # 병렬 코드 생성 끄기 (하나의 단위로 분석하여 최적화 효율 증대)
+panic = "abort"   # 패닉 발생 시 스택 풀기 생략 (코드 크기 감소 및 속도 향상)

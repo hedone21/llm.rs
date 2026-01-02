@@ -1,6 +1,7 @@
 // RMS Norm: Block-based reduction
 __kernel void kernel_rms_norm(
     __global const float * x,
+    __global const float * w,
     __global float * dst,
     const int ncols,
     const float eps,
@@ -34,6 +35,6 @@ __kernel void kernel_rms_norm(
     float scale = 1.0f / sqrt(mean + eps);
 
     for (int i = tid; i < ncols; i += block_size) {
-        dst_row[i] = x_row[i] * scale;
+        dst_row[i] = x_row[i] * scale * w[i];
     }
 }

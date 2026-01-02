@@ -2,7 +2,7 @@ use crate::backend::{Backend, Device};
 use crate::core::shape::Shape;
 use crate::core::tensor::{Storage, Tensor};
 use log::*;
-use ocl::{Buffer, ProQue, flags};
+use ocl::{Buffer, MemMap, ProQue, flags};
 use std::sync::{Mutex, OnceLock};
 
 static CL_CONTEXT: OnceLock<ProQue> = OnceLock::new();
@@ -13,13 +13,14 @@ pub fn cl_context() -> &'static ProQue {
         // [Step 1] Load Kernels from files
         // Assumes 'kernels' directory is at the project root
         let src = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             include_str!("../../kernels/common.cl"),
             include_str!("../../kernels/rms_norm.cl"),
             include_str!("../../kernels/matmul_q4.cl"),
             include_str!("../../kernels/matmul_f32.cl"),
             include_str!("../../kernels/rope.cl"),
             include_str!("../../kernels/elementwise.cl"),
+            include_str!("../../kernels/copy.cl"),
         );
 
         println!("[OpenCL] Loading Kernels from files...");
@@ -32,52 +33,50 @@ pub fn cl_context() -> &'static ProQue {
     })
 }
 
-// Scratch Pool Structure
 struct ScratchPool {
-    buffer: Buffer<f32>, // 거대한 단일 버퍼
-    ptr: *mut f32,       // 매핑된 호스트 포인터
-    capacity: usize,     // 총 엘리먼트 개수 (f32 기준)
-    offset: usize,       // 현재 사용 중인 오프셋
+    buffer: Buffer<f32>,
+    ptr: *mut u8,
+    capacity: usize, // bytes
+    offset: usize,   // bytes
+
+    _guard: MemMap<f32>,
 }
 
 unsafe impl Send for ScratchPool {}
+unsafe impl Sync for ScratchPool {}
 
-// 스크래치 풀 초기화 함수 (Pre-init 단계에서 호출)
 pub fn init_scratch_pool(size_mb: usize) {
     let context = cl_context();
-    // f32는 4바이트이므로 mb * 1024*1024 / 4
-    let num_elements = (size_mb * 1024 * 1024) / 4;
+    let total_bytes = size_mb * 1024 * 1024;
 
-    println!(
-        "[ScratchPool] Allocating shared memory: {} MB ({} elements)",
-        size_mb, num_elements
-    );
+    println!("[ScratchPool] Allocating shared memory: {} MB", size_mb);
 
-    // 1. 거대한 버퍼 할당 (Zero-Copy)
     let buffer = Buffer::<f32>::builder()
         .queue(context.queue().clone())
         .flags(flags::MEM_READ_WRITE | flags::MEM_ALLOC_HOST_PTR)
-        .len(num_elements)
+        .len(total_bytes / 4)
         .build()
         .expect("Failed to allocate scratch pool");
 
-    // 2. 미리 매핑(Mapping)하여 포인터 획득
-    // 주의: Unmap을 하지 않고 유지합니다 (Persistent Mapping)
-    let ptr = unsafe {
+    let mut guard = unsafe {
         buffer
             .map()
             .flags(flags::MAP_WRITE | flags::MAP_READ)
             .enq()
             .expect("Failed to map scratch buffer")
-            .as_mut_ptr()
     };
+
+    let ptr = guard.as_mut_ptr() as *mut u8;
+
+    // std::mem::forget(guard);
 
     SCRATCH_POOL
         .set(Mutex::new(ScratchPool {
             buffer,
             ptr,
-            capacity: num_elements,
+            capacity: total_bytes,
             offset: 0,
+            _guard: guard,
         }))
         .ok();
 }
@@ -123,47 +122,40 @@ impl OpenClBackend {
     // --- Allocators (Existing behavior maintained) ---
     pub fn allocate_shared(&self, shape: &Shape) -> Tensor {
         let count = shape.num_elements();
+        let bytes = count * 4; // f32 크기
 
         if let Some(pool_lock) = SCRATCH_POOL.get() {
             let mut pool = pool_lock.lock().unwrap();
 
-            // 정렬 기준 계산 (예: 128바이트 정렬 = f32 32개 단위)
-            // 실제로는 장치 정보를 쿼리하여 CL_DEVICE_MEM_BASE_ADDR_ALIGN을 쓰는 것이 정확합니다.
-            let alignment_elements = 32; // 128 bytes / 4 bytes per f32
-            let aligned_offset =
-                (pool.offset + alignment_elements - 1) / alignment_elements * alignment_elements;
+            // OpenCL 하드웨어 정렬 기준 (128바이트 정렬 권장)
+            let alignment = 128;
+            let aligned_offset = (pool.offset + alignment - 1) & !(alignment - 1);
 
-            // 용량 체크
-            if aligned_offset + count <= pool.capacity {
-                pool.offset = aligned_offset + count; // 다음을 위해 업데이트
-                let current_offset = aligned_offset;
+            if aligned_offset + bytes <= pool.capacity {
+                pool.offset = aligned_offset + bytes;
 
-                // 1. 호스트 포인터 계산 (단순 산술 연산, 비용 0)
-                let ptr = unsafe { pool.ptr.add(current_offset) };
+                let ptr = unsafe { pool.ptr.add(aligned_offset) };
 
-                // 2. OpenCL Sub-Buffer 생성
-                // (실제 할당이 아니라 뷰만 생성하므로 매우 빠름)
+                // u8 서브 버퍼 생성 후 f32로 재해석(reinterpret)
                 let sub_buffer = pool
                     .buffer
-                    .create_sub_buffer(Some(flags::MEM_READ_WRITE), current_offset, count)
+                    .create_sub_buffer(None, aligned_offset / 4, count)
                     .unwrap();
 
                 return Tensor::from_storage(
                     Storage::Shared {
-                        ptr: ptr as *mut u8,
-                        size: count * 4,
+                        ptr,
+                        size: bytes,
                         cl_buffer: Some(sub_buffer),
                         queue: Some(self.context.queue().clone()),
                     },
                     shape.clone(),
                     Device::OpenCl,
                 );
-            } else {
-                // 풀이 가득 차면 경고 후 일반 할당으로 넘어감 (혹은 패닉)
-                // eprintln!("[Warn] Scratch pool exhausted! Falling back to slow allocation.");
-                error!("Scratch pool exhausted! Falling back to slow allocation.");
             }
         }
+
+        error!("Scratch pool exhausted or uninitialized. Falling back to standard allocation.");
 
         // [Fallback] 풀이 없거나 가득 찬 경우 (기존 방식: 느림)
         let buffer = Buffer::<f32>::builder()
@@ -188,23 +180,73 @@ impl OpenClBackend {
     }
 
     pub fn allocate_shared_q4(&self, shape: &Shape, data_len: usize, scale_len: usize) -> Tensor {
-        let total_bytes = data_len + (scale_len * 4);
-        let buffer = Buffer::<u8>::builder()
+        let alignment = 128;
+        let aligned_data_len = (data_len + alignment - 1) & !(alignment - 1);
+        let total_bytes = aligned_data_len + (scale_len * 4);
+
+        if let Some(pool_lock) = SCRATCH_POOL.get() {
+            let mut pool = pool_lock.lock().unwrap();
+            let aligned_offset = (pool.offset + alignment - 1) & !(alignment - 1);
+
+            if aligned_offset + total_bytes <= pool.capacity {
+                pool.offset = aligned_offset + total_bytes;
+                let ptr = unsafe { pool.ptr.add(aligned_offset) };
+
+                // u8 서브 버퍼 그대로 사용
+                let sub_buffer = pool
+                    .buffer
+                    .create_sub_buffer(None, aligned_offset / 4, total_bytes / 4)
+                    .unwrap();
+
+                // Scales Buffer
+                let sub_scales = pool
+                    .buffer
+                    .create_sub_buffer(
+                        None,
+                        (aligned_offset + aligned_data_len) / 4, // Offset after data
+                        scale_len,                               // Size in floats
+                    )
+                    .unwrap();
+
+                return Tensor::from_storage(
+                    Storage::SharedQ4 {
+                        ptr,
+                        size: total_bytes,
+                        cl_buffer: Some(sub_buffer),
+                        cl_scales: Some(sub_scales), // Store separated handle
+                        queue: Some(self.context.queue().clone()),
+                        data_len: aligned_data_len,
+                        scale_len,
+                    },
+                    shape.clone(),
+                    Device::OpenCl,
+                );
+            }
+        }
+
+        error!("Scratch pool exhausted or uninitialized. Falling back to standard allocation.");
+
+        let buffer = Buffer::<f32>::builder()
             .queue(self.context.queue().clone())
             .flags(flags::MEM_READ_WRITE | flags::MEM_ALLOC_HOST_PTR)
-            .len(total_bytes)
+            .len(total_bytes / 4)
             .build()
             .unwrap();
 
-        let ptr = unsafe { buffer.map().enq().unwrap().as_mut_ptr() };
+        let sub_scales = buffer
+            .create_sub_buffer(None, aligned_data_len / 4, scale_len)
+            .unwrap();
+
+        let ptr = unsafe { buffer.map().enq().unwrap().as_mut_ptr() } as *mut u8;
 
         Tensor::from_storage(
             Storage::SharedQ4 {
                 ptr,
                 size: total_bytes,
                 cl_buffer: Some(buffer),
+                cl_scales: Some(sub_scales),
                 queue: Some(self.context.queue().clone()),
-                data_len,
+                data_len: aligned_data_len,
                 scale_len,
             },
             shape.clone(),
@@ -270,28 +312,26 @@ impl OpenClBackend {
                 Storage::Shared { .. },
                 Storage::SharedQ4 {
                     cl_buffer,
-                    data_len,
-                    scale_len,
+                    cl_scales,
                     ..
                 },
             ) => {
-                let cl_buffer = cl_buffer.as_ref().unwrap();
+                let buf_qs = cl_buffer.as_ref().unwrap();
+                let buf_scales = cl_scales.as_ref().unwrap(); // No more sub-buffer creation failure
+
+                let buf_qs_u8: &Buffer<u8> = unsafe { std::mem::transmute(buf_qs) };
+                let buf_scales_u8: &Buffer<u8> = unsafe { std::mem::transmute(buf_scales) };
 
                 if m == 1 {
                     // Decoding optimization
                     let buf_a = self.get_buffer(a);
                     let buf_c = self.get_buffer(&c);
 
-                    let scale_offset = *data_len;
-                    let buf_scales = cl_buffer
-                        .create_sub_buffer(Some(flags::MEM_READ_WRITE), scale_offset, scale_len * 4)
-                        .unwrap();
-
                     let kernel = self
                         .context
                         .kernel_builder("kernel_mul_mv_q4_0_f32")
-                        .arg(cl_buffer) // qs
-                        .arg(&buf_scales) // scales
+                        .arg(buf_qs_u8) // qs
+                        .arg(buf_scales_u8) // scales
                         .arg(buf_a) // vec input
                         .arg(buf_c) // vec output
                         .arg(k as i32)
@@ -304,7 +344,27 @@ impl OpenClBackend {
                         kernel.enq().unwrap();
                     }
                 } else {
-                    panic!("Q4 MatMul for batch > 1 not implemented yet");
+                    // Matrix-Matrix Q4 MatMul (Batch > 1)
+                    let buf_a = self.get_buffer(a);
+                    let buf_c = self.get_buffer(&c);
+
+                    let kernel = self
+                        .context
+                        .kernel_builder("kernel_mul_mm_q4_0_f32")
+                        .arg(buf_qs_u8) // qs
+                        .arg(buf_scales_u8) // scales
+                        .arg(buf_a) // Matrix A
+                        .arg(buf_c) // Matrix C
+                        .arg(k as i32)
+                        .arg(n as i32)
+                        .arg(m as i32)
+                        .global_work_size([n, m]) // 2D grid: [Columns, Rows]
+                        .build()
+                        .unwrap();
+
+                    unsafe {
+                        kernel.enq().unwrap();
+                    }
                 }
             }
             // Fallback for F32 x F32 Transposed
@@ -355,7 +415,7 @@ impl OpenClBackend {
         }
 
         // 2. Perform MatMul on GPU using the standard matmul (F32 x F32 path)
-        self.matmul(a, &slice_tensor)
+        self.matmul_transposed(a, &slice_tensor)
     }
 
     pub fn rms_norm(&self, x: &Tensor, w: &Tensor, eps: f32) -> Tensor {
@@ -370,6 +430,7 @@ impl OpenClBackend {
             .context
             .kernel_builder("kernel_rms_norm")
             .arg(self.get_buffer(x))
+            .arg(self.get_buffer(w))
             .arg(self.get_buffer(&o))
             .arg(hidden as i32)
             .arg(eps)
@@ -403,7 +464,7 @@ impl OpenClBackend {
             .arg((head_dim / 2) as i32)
             .arg(n_heads as i32)
             .arg(start_pos as i32)
-            .arg(10000.0f32) // freq_base
+            .arg(500000.0f32) // freq_base
             .arg(1.0f32) // freq_scale
             .global_work_size([head_dim / 2, n_heads, seq_len])
             .build()
@@ -492,19 +553,22 @@ impl OpenClBackend {
     }
 
     pub fn copy_from(&self, t: &Tensor) -> Tensor {
-        let mut o = self.allocate_shared(t.shape());
+        let o = self.allocate_shared(t.shape());
+
+        let kernel = self
+            .context
+            .kernel_builder("kernel_copy")
+            .arg(self.get_buffer(t))
+            .arg(self.get_buffer(&o))
+            .arg(t.shape().num_elements() as i32)
+            .global_work_size(t.shape().num_elements())
+            .build()
+            .unwrap();
+
         unsafe {
-            let src = match &*t.storage {
-                Storage::Shared { ptr, .. } => *ptr,
-                Storage::Cpu(d) => d.as_ptr() as *mut u8,
-                _ => panic!("Clone source invalid"),
-            };
-            let dst = match &*o.storage {
-                Storage::Shared { ptr, .. } => *ptr,
-                _ => unreachable!(),
-            };
-            std::ptr::copy_nonoverlapping(src, dst, t.shape().num_elements() * 4);
+            kernel.enq().unwrap();
         }
+        self.context.queue().finish().unwrap();
         o
     }
 

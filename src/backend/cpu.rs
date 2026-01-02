@@ -48,10 +48,25 @@ impl Backend for CpuBackend {
 
         match &*b.storage {
             // [Case 1] Q4 Quantized Weights (기존 최적화 유지 + 버그 수정)
-            Storage::CpuQ4 {
-                data: b_q,
-                scales: b_s,
-            } => {
+            Storage::CpuQ4 { .. } | Storage::SharedQ4 { .. } => {
+                let (b_q_slice, b_s_slice) = match &*b.storage {
+                    Storage::CpuQ4 { data, scales } => (data.as_slice(), scales.as_slice()),
+                    Storage::SharedQ4 {
+                        ptr,
+                        data_len,
+                        scale_len,
+                        ..
+                    } => unsafe {
+                        (
+                            std::slice::from_raw_parts(*ptr as *const u8, *data_len),
+                            std::slice::from_raw_parts(
+                                (*ptr).add(*data_len) as *const f32,
+                                *scale_len,
+                            ),
+                        )
+                    },
+                    _ => unreachable!(),
+                };
                 let block_size = 32;
                 let num_blocks = k / block_size;
 
@@ -67,7 +82,8 @@ impl Backend for CpuBackend {
                         |(cid, res_chunk)| {
                             let start_col = cid * chunk_size;
                             self.call_simd_kernel_q4(
-                                res_chunk, start_col, k, num_blocks, b_q, b_s, &a_q8, &a_scales,
+                                res_chunk, start_col, k, num_blocks, b_q_slice, b_s_slice, &a_q8,
+                                &a_scales,
                             );
                         },
                     );
@@ -86,7 +102,8 @@ impl Backend for CpuBackend {
                             for (cid, res_chunk) in res_row.chunks_mut(chunk_size).enumerate() {
                                 let start_col = cid * chunk_size;
                                 self.call_simd_kernel_q4(
-                                    res_chunk, start_col, k, num_blocks, b_q, b_s, &a_q8, &a_scales,
+                                    res_chunk, start_col, k, num_blocks, b_q_slice, b_s_slice,
+                                    &a_q8, &a_scales,
                                 );
                             }
                         });
@@ -260,6 +277,9 @@ impl Backend for CpuBackend {
         }
         let a_data = match Arc::get_mut(&mut a.storage) {
             Some(Storage::Cpu(d)) => d,
+            Some(Storage::Shared { ptr, size, .. }) => unsafe {
+                std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
+            },
             _ => panic!("Cannot mutate shared/non-cpu storage"),
         };
         let b_data = match &*b.storage {
@@ -281,6 +301,9 @@ impl Backend for CpuBackend {
         }
         let gate_data = match Arc::get_mut(&mut gate.storage) {
             Some(Storage::Cpu(d)) => d,
+            Some(Storage::Shared { ptr, size, .. }) => unsafe {
+                std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
+            },
             _ => panic!("Cannot mutate"),
         };
         let up_data = match &*up.storage {
@@ -308,6 +331,9 @@ impl Backend for CpuBackend {
 
         let x_data = match Arc::get_mut(&mut x.storage) {
             Some(Storage::Cpu(d)) => d,
+            Some(Storage::Shared { ptr, size, .. }) => unsafe {
+                std::slice::from_raw_parts_mut(*ptr as *mut f32, *size / 4)
+            },
             _ => panic!("Cannot mutate"),
         };
 
