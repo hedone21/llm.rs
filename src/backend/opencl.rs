@@ -127,10 +127,16 @@ impl OpenClBackend {
         if let Some(pool_lock) = SCRATCH_POOL.get() {
             let mut pool = pool_lock.lock().unwrap();
 
+            // 정렬 기준 계산 (예: 128바이트 정렬 = f32 32개 단위)
+            // 실제로는 장치 정보를 쿼리하여 CL_DEVICE_MEM_BASE_ADDR_ALIGN을 쓰는 것이 정확합니다.
+            let alignment_elements = 32; // 128 bytes / 4 bytes per f32
+            let aligned_offset =
+                (pool.offset + alignment_elements - 1) / alignment_elements * alignment_elements;
+
             // 용량 체크
-            if pool.offset + count <= pool.capacity {
-                let current_offset = pool.offset;
-                pool.offset += count;
+            if aligned_offset + count <= pool.capacity {
+                pool.offset = aligned_offset + count; // 다음을 위해 업데이트
+                let current_offset = aligned_offset;
 
                 // 1. 호스트 포인터 계산 (단순 산술 연산, 비용 0)
                 let ptr = unsafe { pool.ptr.add(current_offset) };
