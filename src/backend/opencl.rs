@@ -502,7 +502,25 @@ impl OpenClBackend {
         o
     }
 
-    pub fn launch_dummy_kernel(&self, _: &Tensor) {}
+    pub fn launch_dummy_kernel(&self, t: &Tensor) {
+        let n = t.shape().num_elements();
+        // elementwise.cl 등에 간단한 덧셈 커널이 있다고 가정하거나
+        // 기존의 kernel_add를 재사용할 수 있습니다.
+        let kernel = self
+            .context
+            .kernel_builder("kernel_add") // 이미 구현된 커널 사용
+            .arg(self.get_buffer(t))
+            .arg(self.get_buffer(t)) // 자기 자신을 두 번 전달하거나 1.0을 더하는 커널 필요
+            .arg(n as i32)
+            .global_work_size(n)
+            .build()
+            .unwrap();
+
+        unsafe {
+            kernel.enq().unwrap();
+        }
+        self.context.queue().finish().unwrap();
+    }
 }
 
 impl Backend for OpenClBackend {

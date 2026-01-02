@@ -121,15 +121,15 @@ fn main() -> Result<()> {
 
         // 3. GPU 커널 실행 (각 원소에 +1.0)
         // 데이터 복사(WriteBuffer/ReadBuffer) 없이 커널만 실행합니다.
-        println!("Launching GPU kernel (add +1.0)...");
+        println!("Launching GPU kernel to add itself");
         cl_backend.launch_dummy_kernel(&tensor);
 
         // 4. CPU에서 데이터 확인
         {
             let data = tensor.data();
             println!("Result check: {:?}", data);
-            if data[0] == 11.0 {
-                println!(">> SUCCESS: Zero-Copy Shared Memory works! (10.0 -> 11.0)");
+            if data[0] == 20.0 {
+                println!(">> SUCCESS: Zero-Copy Shared Memory works! (10.0 -> 20.0)");
             } else {
                 println!(">> FAILURE: Value mismatch. Got {}", data[0]);
             }
