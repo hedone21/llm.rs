@@ -11,6 +11,10 @@ path = "src/main.rs"
 name = "llmrs-test"
 path = "src/bin/llmrs_test.rs"
 
+[[bin]]
+name = "llmrs-bench"
+path = "src/bench/main.rs"
+
 [dependencies]
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
